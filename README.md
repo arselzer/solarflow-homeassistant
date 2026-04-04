@@ -63,7 +63,8 @@ All sensor comments reference the official zenSDK property name, access mode, an
 
 ### 1. Prepare the SolarFlow
 
-- Set the Zendure to **base load mode** with **0 watts** (in the app's on-grid settings).
+- Connect the SolarFlow to your WiFi network. You can use the Zendure app, or — if you want a fully account-free setup — use **[Solarflow Web Bluetooth Manager](https://arselzer.github.io/solarflow-bluetooth/)** ([source](https://github.com/arselzer/solarflow-bluetooth)) to provision WiFi directly from your browser via Bluetooth, no app or Zendure account required.
+- Set the Zendure to **base load mode** with **0 watts** (in the app's on-grid settings, or via BLE/HTTP).
 - Set BMS minimum discharge to **5 %** and maximum charge to **100 %**.
 - **Block the SolarFlow's internet access** (e.g. via router firewall). The device works fully offline once configured.
 - Disable Shelly 3EM Pro cloud access.
@@ -315,6 +316,12 @@ Compared to [Utini2000/Zendure-Solarflow-Local-HomeAssistant](https://github.com
 | System Efficiency | (output + charge) / solar input × 100 (%) |
 
 </details>
+
+---
+
+## See also
+
+- **[Solarflow Web Bluetooth Manager](https://arselzer.github.io/solarflow-bluetooth/)** ([source](https://github.com/arselzer/solarflow-bluetooth)) — browser-based tool for connecting Zendure SolarFlow devices to WiFi over Bluetooth. No app, no account, no Python required. Includes WiFi provisioning, MQTT redirection, live telemetry, and device configuration. Supports SF 800 Pro.
 
 ---
 
