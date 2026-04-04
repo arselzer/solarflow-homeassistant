@@ -1,0 +1,809 @@
+################################################################################
+#                   ZENDURE SOLARFLOW CONTROL PACKAGE                          #
+################################################################################
+#
+# DESCRIPTION:
+# Advanced local control for Zendure SolarFlow with Shelly 3EM.
+# Features strict validation, safe math, and separate state/loop logic.
+#
+# REQUIREMENTS:
+# - Zendure Hyper 2000 / SolarFlow 800 Pro (HTTP API enabled)
+# - Shelly Pro 3EM (Grid measurement)
+# - Integration "Forecast.Solar"
+#
+# SETUP:
+# 1. Set the Zendure to base load mode with 0 watts
+# 2. Set BMS minimum discharge to 5% (and 100% maximum charge)
+# 3. Remove Zendure's external internet access (e.g. block via router)
+# 4. Disable Shelly 3EM Pro cloud access
+# 5. Save this file and zendure_extended.yaml in packages/
+# 6. Set your device IP below in input_text.zendure_device_ip
+# 7. Add configuration.yaml entries (see README)
+# 8. Restart Home Assistant
+#
+# STRATEGY (Managed by Logic Manager):
+# - WINTER: Stop at 20% SoC | Bias 10W (Import) | Saturation 250W
+# - SUMMER: Stop at 8% SoC  | Bias 0W (Zero)    | Saturation 250W
+#
+# NETWORK STABILITY:
+# - Polling: 15s | Timeout: 30s | No forced updates (Anti-DDoS).
+#
+################################################################################
+
+# ==============================================================================
+# 1. CONFIGURATION (HELPERS)
+# ==============================================================================
+
+# ── DEVICE IP (CENTRAL CONFIGURATION) ────────────────────────────────────────
+# Change this to your SolarFlow's local IP address.
+# Editable from the HA UI: Settings → Devices → Helpers
+input_text:
+  zendure_device_ip:
+    name: "Zendure: Device IP Address"
+    icon: mdi:ip-network
+    initial: "192.168.30.91"
+    pattern: "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+    mode: text
+
+input_boolean:
+  zendure_auto_mode:
+    name: "Zendure Auto Mode Active"
+    icon: mdi:robot
+    initial: true
+  
+  zendure_emergency_charge:
+    name: "Status: Emergency Charging"
+    icon: mdi:battery-alert
+    initial: false
+
+  zendure_calibration_mode:
+    name: "Status: Calibration Running"
+    icon: mdi:battery-sync
+    initial: false
+
+input_datetime:
+  zendure_last_full_charge:
+    name: "Last 100% Charge At"
+    has_date: true
+    has_time: true
+
+input_number:
+  # --- INTERNAL MEMORY ---
+  zendure_last_sent_limit:
+    name: "System: Last Sent Value"
+    min: -2
+    max: 1200
+    step: 1
+    mode: box
+
+  # --- SETTINGS ---
+  zendure_conf_max_output:
+    name: "Zendure: Max Output"
+    min: 0
+    max: 800
+    step: 10
+    initial: 800
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_failsafe_watt:
+    name: "Zendure: Failsafe Base Load"
+    icon: mdi:network-off-outline
+    min: 0
+    max: 800
+    step: 10
+    initial: 130
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_saturation_watt:
+    name: "Zendure: Min Output at 100%"
+    icon: mdi:water-percent
+    min: 0
+    max: 800
+    step: 10
+    initial: 250
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_grid_bias:
+    name: "Zendure: Grid Buffer (Bias)"
+    icon: mdi:arrow-collapse-right
+    min: -100
+    max: 100
+    step: 5
+    initial: 10
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_hysteresis:
+    name: "Zendure: Control Hysteresis"
+    icon: mdi:target-variant
+    min: 1
+    max: 50
+    step: 1
+    initial: 5
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_emergency_watt:
+    name: "Zendure: AC Charge Speed"
+    icon: mdi:flash
+    min: 50
+    max: 1200
+    step: 50
+    initial: 500
+    unit_of_measurement: "W"
+    mode: box
+
+  # --- BATTERY LIMITS ---
+  zendure_conf_soc_off:
+    name: "SoC Limit: Cutoff (Auto-Season)"
+    icon: mdi:battery-off
+    min: 0
+    max: 30
+    initial: 20
+    unit_of_measurement: "%"
+
+  zendure_conf_soc_bypass:
+    name: "SoC Limit: Bypass Mode"
+    icon: mdi:battery-heart-variant
+    min: 10
+    max: 90
+    initial: 30
+    unit_of_measurement: "%"
+
+  zendure_conf_soc_emerg_start:
+    name: "SoC Limit: Start Emergency Charge"
+    min: 0
+    max: 20
+    initial: 6
+    unit_of_measurement: "%"
+
+  zendure_conf_soc_emerg_stop:
+    name: "SoC Limit: Stop Emergency Charge"
+    min: 5
+    max: 50
+    initial: 15
+    unit_of_measurement: "%"
+
+  # --- LOGIC OPTIONS ---
+  zendure_conf_forecast_thresh:
+    name: "Weather: kWh Tomorrow for Charge Stop"
+    icon: mdi:weather-sunny
+    min: 0
+    max: 20
+    step: 0.5
+    initial: 2.5 
+    unit_of_measurement: "kWh"
+    mode: box
+
+  zendure_conf_calib_days:
+    name: "Calibration: Max Days Without 100%"
+    icon: mdi:calendar-refresh
+    min: 1
+    max: 30
+    step: 1
+    initial: 7
+    unit_of_measurement: "days"
+    mode: box
+
+
+# ==============================================================================
+# 2. SENSORS (REST INTEGRATION WITH TEMPLATED URL)
+# ==============================================================================
+# Uses the modern "rest:" integration (not "sensor: platform: rest") to
+# support resource_template, so the IP comes from input_text.
+rest:
+  - resource_template: >-
+      http://{{ states('input_text.zendure_device_ip') }}/properties/report
+    scan_interval: 15
+    timeout: 30
+    sensor:
+      - name: "SolarFlow Status Raw"
+        unique_id: solarflow_status_raw
+        value_template: >-
+          {% if value_json is defined and value_json.properties is defined %}
+            OK
+          {% else %}
+            unavailable
+          {% endif %}
+        json_attributes:
+          - sn
+          - properties
+          - packData
+
+sensor:
+  - platform: integration
+    source: sensor.solarflow_solar_input
+    name: "SolarFlow Solar Energy Total"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.solarflow_pack_input_power
+    name: "SolarFlow Battery Energy Charged"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.solarflow_pack_output_power
+    name: "SolarFlow Battery Energy Discharged"
+    unit_prefix: k
+    round: 3
+    method: left
+
+
+# ==============================================================================
+# 3. TEMPLATE SENSORS (ZERO-DROP PROTECTION)
+# ==============================================================================
+template:
+  - sensor:
+      # electricLevel (RO): "Average SOC" (per zenSDK docs)
+      - name: "SolarFlow Battery Level"
+        unique_id: solarflow_battery_level
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {{ p.get('electricLevel', 0) | int }}
+          {% else %}
+            unavailable
+          {% endif %}
+      
+      # outputLimit (RW): "Output limit" (per zenSDK docs)
+      - name: "SolarFlow Output Limit"
+        unique_id: solarflow_output_limit
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {{ p.get('outputLimit', 0) | int }}
+          {% else %}
+            unavailable
+          {% endif %}
+        
+      # solarInputPower (RO): "Total PV input" (per zenSDK docs)
+      - name: "SolarFlow Solar Input"
+        unique_id: solarflow_solar_input
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarInputPower', 0) | int %}
+            {{ [val, 0] | max }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # hyperTmp (RO): "Enclosure temperature" (per zenSDK docs)
+      # Stored in 0.1 Kelvin. Conversion: (val - 2731) / 10.0
+      - name: "SolarFlow Enclosure Temp"
+        unique_id: solarflow_device_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >-
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set raw = p.get('hyperTmp', 2931) | int %}
+            {{ ((raw - 2731) / 10.0) | round(1) }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # NET FLOW LOGIC (Prevents Dashboard Errors) & SENSOR SWAP
+      # Official Zendure names (zenSDK docs):
+      #   outputPackPower = "Battery charge power"   (system → battery)
+      #   packInputPower  = "Battery discharge power" (battery → system)
+      - name: "SolarFlow Pack Input Power"
+        unique_id: solarflow_pack_input_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {# SWAP: Charge sensor reads 'outputPackPower' (battery charge power) #}
+            {% set in_raw = [p.get('outputPackPower', 0)|int, 0] | max %}
+            {# SWAP: Discharge sensor reads 'packInputPower' (battery discharge power) #}
+            {% set out_raw = [p.get('packInputPower', 0)|int, 0] | max %}
+            
+            {% set net = in_raw - out_raw %}
+            {% if net > 0 %} {{ net }} {% else %} 0 {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow Pack Output Power"
+        unique_id: solarflow_pack_output_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {# SWAP: Charge sensor reads 'outputPackPower' (battery charge power) #}
+            {% set in_raw = [p.get('outputPackPower', 0)|int, 0] | max %}
+            {# SWAP: Discharge sensor reads 'packInputPower' (battery discharge power) #}
+            {% set out_raw = [p.get('packInputPower', 0)|int, 0] | max %}
+            
+            {% set net = in_raw - out_raw %}
+            {% if net < 0 %} {{ net | abs }} {% else %} 0 {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+# ==============================================================================
+# 4. REST COMMANDS (USING CENTRALIZED IP)
+# ==============================================================================
+rest_command:
+  zendure_set_output:
+    url: >-
+      http://{{ states('input_text.zendure_device_ip') }}/properties/write
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {
+        "properties": {
+          "outputLimit": {{ limit | int }},
+          "chargeMaxLimit": 0
+        },
+        "sn": "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
+      }
+
+  zendure_force_charge:
+    url: >-
+      http://{{ states('input_text.zendure_device_ip') }}/properties/write
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {
+        "properties": {
+          "outputLimit": 0,
+          "chargeMaxLimit": {{ limit | int }}
+        },
+        "sn": "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
+      }
+
+  # Generic property writer (used for smartMode init and other settings)
+  zendure_set_property:
+    url: >-
+      http://{{ states('input_text.zendure_device_ip') }}/properties/write
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {{ payload }}
+
+
+# ==============================================================================
+# 5. AUTOMATION A: STATE MACHINE
+# ==============================================================================
+automation:
+  - alias: "Zendure: State Machine"
+    id: "zendure_state_machine_stable"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id:
+          - input_boolean.zendure_emergency_charge
+          - input_boolean.zendure_calibration_mode
+    condition:
+      # Safety: SN must exist
+      - condition: template
+        value_template: "{{ state_attr('sensor.solarflow_status_raw','sn') is not none }}"
+    action:
+      - choose:
+          # CASE 1: START CHARGING
+          - conditions: >
+              {{ is_state('input_boolean.zendure_emergency_charge','on')
+                 or is_state('input_boolean.zendure_calibration_mode','on') }}
+            sequence:
+              - service: rest_command.zendure_force_charge
+                data:
+                  limit: "{{ states('input_number.zendure_conf_emergency_watt')|int }}"
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: -2 
+
+          # CASE 2: STOP CHARGING (Back to 0W)
+          - conditions: >
+              {{ is_state('input_boolean.zendure_emergency_charge','off')
+                 and is_state('input_boolean.zendure_calibration_mode','off') }}
+            sequence:
+              - service: rest_command.zendure_set_output
+                data:
+                  limit: 0
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: 0
+
+
+# ==============================================================================
+# 6. AUTOMATION B: CONTROL LOOP (MAIN LOOP)
+# ==============================================================================
+  - alias: "Zendure: Control Loop"
+    id: "zendure_control_loop_stable"
+    mode: restart
+    trigger:
+      - platform: time_pattern
+        seconds: "/5"
+    
+    condition:
+      - condition: state
+        entity_id: input_boolean.zendure_auto_mode
+        state: "on"
+      # Pause during charge mode
+      - condition: state
+        entity_id: input_boolean.zendure_emergency_charge
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.zendure_calibration_mode
+        state: "off"
+
+    action:
+      - variables:
+          # --- CONFIG ---
+          max_output: "{{ states('input_number.zendure_conf_max_output') | int }}"
+          failsafe_watt: "{{ states('input_number.zendure_conf_failsafe_watt') | int }}"
+          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt') | int }}"
+          hysteresis_watt: "{{ states('input_number.zendure_conf_hysteresis') | int }}"
+          grid_bias: "{{ states('input_number.zendure_conf_grid_bias') | int }}"
+          
+          soc_off: "{{ states('input_number.zendure_conf_soc_off') | int }}"
+          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
+          
+          # --- SENSORS & MEMORY ---
+          shelly_ok: "{{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}"
+          zendure_ok: "{{ states('sensor.solarflow_status_raw') == 'OK' }}"
+          sn_ok: "{{ state_attr('sensor.solarflow_status_raw','sn') is not none }}"
+          
+          # Memory logic
+          raw_last_sent: "{{ states('input_number.zendure_last_sent_limit') | int }}"
+          current_limit: "{{ states('sensor.solarflow_output_limit') | float(0) }}"
+          
+          # Check drift
+          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs > 150 }}"
+          
+          # Safe base
+          base_value: >
+             {% if raw_last_sent < 0 or is_drifting %}
+               {{ current_limit }}
+             {% else %}
+               {{ raw_last_sent }}
+             {% endif %}
+
+          temp_device: "{{ states('sensor.solarflow_device_temp') | float(20) }}"
+          battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
+          pv_power: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
+
+          grid_power: >
+            {% if shelly_ok %}
+              {{ (states('sensor.power_import') | float(0) - states('sensor.power_export') | float(0)) }}
+            {% else %} 0 {% endif %}
+
+
+      # --- SELF-HEALING MEMORY ---
+      - choose:
+          - conditions: "{{ is_drifting }}"
+            sequence:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: "{{ current_limit | int }}"
+
+
+      # --- CALCULATION BLOCK ---
+      - variables:
+          calc_target: >
+            {# PRIO 1: FAILSAFE (Strict SN Check) #}
+            {% if not shelly_ok and zendure_ok and sn_ok %}
+              {{ failsafe_watt }}
+
+            {# PRIO 2: API/SN ERROR #}
+            {% elif not (zendure_ok and sn_ok) %}
+              -1
+
+            {# PRIO 3: WINTER PROTECTION #}
+            {% elif temp_device < 0 and pv_power < 100 %}
+              0
+
+            {# PRIO 4: BATTERY EMPTY #}
+            {% elif battery <= soc_off %}
+              0
+
+            {# PRIO 5: BYPASS (CONSERVATION MODE) #}
+            {% elif battery > soc_off and battery <= soc_bypass %}
+               {# Target = House Load - Bias #}
+               {% set house_demand = base_value + grid_power - grid_bias %}
+               
+               {% set available_solar = (pv_power * 0.9) | int %}
+               {% set tmp = [house_demand, available_solar] | min %}
+               {% if tmp < 0 %} 0 {% else %} {{ tmp | int }} {% endif %}
+
+            {# PRIO 6: NORMAL OPERATION #}
+            {% else %}
+               {# Base logic: Start from Last Sent, add grid discrepancy, subtract bias #}
+               {% set target_base = base_value + grid_power - grid_bias %}
+               
+               {# Saturation logic #}
+               {% if battery > 98 and pv_power > saturation_watt %}
+                  {% set target_final = [target_base, saturation_watt] | max %}
+               {% else %}
+                  {% set target_final = target_base %}
+               {% endif %}
+
+               {# Safety bounds #}
+               {% if target_final < 0 %} 0
+               {% elif target_final > max_output %} {{ max_output }}
+               {% else %} {{ target_final | int }} {% endif %}
+            {% endif %}
+
+
+      # --- EXECUTION BLOCK (GATED) ---
+      - choose:
+          # Case: Error -> Abort
+          - conditions: "{{ calc_target | int == -1 }}"
+            sequence: []
+          
+          # Case: Fast Export Clamp
+          - conditions: 
+              - condition: template
+                value_template: "{{ zendure_ok and sn_ok and grid_power < -80 and calc_target < base_value }}"
+            sequence:
+              - service: rest_command.zendure_set_output
+                data:
+                  limit: "{{ calc_target | int }}"
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: "{{ calc_target | int }}"
+
+          # Case: Normal Adjustment
+          - conditions:
+              - condition: template
+                value_template: "{{ zendure_ok and sn_ok }}"
+              - condition: template
+                value_template: "{{ (calc_target | int - base_value) | abs > hysteresis_watt }}"
+            sequence:
+              - service: rest_command.zendure_set_output
+                data:
+                  limit: "{{ calc_target | int }}"
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: "{{ calc_target | int }}"
+
+
+# ==============================================================================
+# 7. AUTOMATION C: LOGIC MANAGER (DAILY & CHECK)
+# ==============================================================================
+  # Track last time battery was full
+  - alias: "Zendure: Track 100% Charge"
+    id: "zendure_track_100_percent_stable"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.solarflow_battery_level
+        above: 99
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.zendure_last_full_charge
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # Logic Manager
+  - alias: "Zendure: Logic Manager"
+    id: "zendure_logic_manager_stable"
+    trigger:
+      - platform: time
+        at: "00:00:00"
+      - platform: time_pattern
+        minutes: "/10"
+      - platform: state
+        entity_id: sensor.solarflow_battery_level
+    
+    action:
+      # 1. Season Switch (SoC Limit & Grid Bias & Saturation)
+      - choose:
+          # --- WINTER (October to March) ---
+          - conditions: "{{ now().month >= 10 or now().month < 4 }}"
+            sequence:
+              # Limit: Stop earlier (20%)
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_soc_off
+                data:
+                  value: 20
+              # Bias: Allow 10W grid import (safety margin)
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_grid_bias
+                data:
+                  value: 10
+              # Saturation: 250W
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_saturation_watt
+                data:
+                  value: 250
+
+          # --- SUMMER (April to September) ---
+          - conditions: "{{ now().month >= 4 and now().month < 10 }}"
+            sequence:
+              # Limit: Deep discharge (8%)
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_soc_off
+                data:
+                  value: 8
+              # Bias: 0W (true zero export)
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_grid_bias
+                data:
+                  value: 0
+              # Saturation: 250W
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_conf_saturation_watt
+                data:
+                  value: 250
+
+      # 2. Check Emergency Charge
+      - variables:
+          bat: "{{ states('sensor.solarflow_battery_level')|float(0) }}"
+          start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
+          stop_lim: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
+          thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
+      
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ bat < start_lim }}"
+              - condition: template
+                value_template: "{{ forecast < thresh or bat < 3 }}"
+              - condition: state
+                entity_id: input_boolean.zendure_emergency_charge
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.zendure_emergency_charge
+          
+          - conditions:
+              - condition: template
+                value_template: "{{ bat > stop_lim }}"
+              - condition: state
+                entity_id: input_boolean.zendure_emergency_charge
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.zendure_emergency_charge
+
+      # 3. Check Calibration
+      - variables:
+          days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
+          last_run: "{{ states('input_datetime.zendure_last_full_charge') }}"
+          days_diff: >
+            {% if last_run not in ['unknown', 'unavailable'] %}
+              {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
+            {% else %} 999 {% endif %}
+      
+      - choose:
+          - conditions: 
+              - condition: template
+                value_template: "{{ days_diff | float >= days_threshold }}"
+              - condition: state
+                entity_id: input_boolean.zendure_calibration_mode
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.zendure_calibration_mode
+              - service: persistent_notification.create
+                data:
+                  title: "Zendure Cell Maintenance"
+                  message: "Starting calibration ({{ days_diff | int }} days without full charge)."
+          
+          - conditions:
+              - condition: template
+                value_template: "{{ bat >= 100 }}"
+              - condition: state
+                entity_id: input_boolean.zendure_calibration_mode
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.zendure_calibration_mode
+              - service: persistent_notification.create
+                data:
+                  title: "Zendure Calibration"
+                  message: "Complete (100% reached)."
+
+
+# ==============================================================================
+# 8. FLASH PROTECTION (smartMode)
+# ==============================================================================
+# The SolarFlow writes every outputLimit change to internal flash by default
+# (smartMode=0). Since the control loop writes every 5 seconds, this wears
+# out the ESP32's flash storage over time (~17,000 writes/day).
+#
+# smartMode=1 writes to RAM instead — values reset on reboot, but this
+# script re-applies them within 5 seconds anyway.
+#
+# This automation sets smartMode=1 once after HA startup / device reconnect.
+
+  - alias: "Zendure: Flash Protection (smartMode=RAM)"
+    id: "zendure_flash_protection_stable"
+    trigger:
+      # Run once when the sensor first becomes available after HA restart
+      - platform: state
+        entity_id: sensor.solarflow_status_raw
+        to: "OK"
+    condition:
+      # Only act if smartMode is currently 0 (Flash)
+      - condition: template
+        value_template: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {{ p is mapping and p.get('smartMode', 0) | int == 0 }}
+      - condition: template
+        value_template: "{{ state_attr('sensor.solarflow_status_raw','sn') is not none }}"
+    action:
+      # Wait for the device to be fully ready after reconnect
+      - delay: "00:00:10"
+      - service: rest_command.zendure_set_property
+        data:
+          payload: >
+            {
+              "properties": { "smartMode": 1 },
+              "sn": "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
+            }
+      - service: persistent_notification.create
+        data:
+          title: "Zendure Flash Protection"
+          message: "smartMode set to RAM (1). Flash wear protection active."
+          notification_id: "zendure_smartmode"
+
+
+# ==============================================================================
+# 9. MONITORING
+# ==============================================================================
+  - alias: "Zendure: Shelly Offline Warning"
+    id: "zendure_notify_shelly_fail_stable"
+    trigger:
+      - platform: template
+        value_template: >
+          {{ not (states('sensor.power_import') | is_number and states('sensor.power_export') | is_number) }}
+        for: "00:00:30"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️ Zendure Failsafe"
+          message: "Shelly offline. Failsafe base load active."
+          notification_id: "zendure_failsafe_alert"
+
+  - alias: "Zendure: Shelly Recovery Notice"
+    id: "zendure_notify_shelly_ok_stable"
+    trigger:
+      - platform: template
+        value_template: >
+          {{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}
+        for: "00:00:10"
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: "zendure_failsafe_alert"

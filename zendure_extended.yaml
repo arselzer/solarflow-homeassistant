@@ -1,0 +1,1101 @@
+################################################################################
+#            ZENDURE SOLARFLOW - EXTENDED SENSORS ADDON                        #
+################################################################################
+#
+# DESCRIPTION:
+# Drop-in extension for the zakazak Zendure control package.
+# Adds sensors for: per-panel solar power (4 MPPT channels), per-battery
+# pack details (2 packs), output to home, WiFi signal, remaining time,
+# grid power, status flags, fan info, and more.
+#
+# Verified against actual API response from SolarFlow 800 Pro
+# (firmware product: solarFlow800Pro, 2 x AB2000 packs).
+#
+# INSTALLATION:
+# 1. Save as "zendure_extended.yaml" in your packages/ folder
+# 2. In your main zendure.yaml, update the REST sensor json_attributes:
+#
+#      json_attributes:
+#        - sn
+#        - properties
+#        - packData          # <-- ADD THIS LINE
+#
+# 3. Restart Home Assistant
+#
+# DISCOVERY:
+#   curl -s http://YOUR_IP/properties/report | python3 -m json.tool
+#
+################################################################################
+
+
+# ==============================================================================
+# EXTENDED TEMPLATE SENSORS
+# ==============================================================================
+template:
+  - sensor:
+
+      # ════════════════════════════════════════════════════════════════════
+      # PER-PANEL SOLAR POWER (4 MPPT CHANNELS)
+      # ════════════════════════════════════════════════════════════════════
+      # solarPower1~6 (RO): "PV channel power" (per zenSDK docs)
+      # The SolarFlow 800 Pro reports channels 1-4.
+
+      - name: "SolarFlow Solar Power Panel 1"
+        unique_id: solarflow_solar_power_panel_1
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:solar-panel
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarPower1', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow Solar Power Panel 2"
+        unique_id: solarflow_solar_power_panel_2
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:solar-panel
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarPower2', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow Solar Power Panel 3"
+        unique_id: solarflow_solar_power_panel_3
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:solar-panel
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarPower3', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow Solar Power Panel 4"
+        unique_id: solarflow_solar_power_panel_4
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:solar-panel
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarPower4', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # POWER FLOW SENSORS
+      # ════════════════════════════════════════════════════════════════════
+
+      # ── OUTPUT TO HOME ────────────────────────────────────────────────
+      # outputHomePower (RO): "Output to home" (per zenSDK docs)
+      # Actual power delivered to the micro-inverter right now.
+      # May differ from outputLimit (the target).
+
+      - name: "SolarFlow Output Home Power"
+        unique_id: solarflow_output_home_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:home-lightning-bolt
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('outputHomePower', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── GRID INPUT POWER ──────────────────────────────────────────────
+      # gridInputPower (RO): "Grid input power" (per zenSDK docs)
+
+      - name: "SolarFlow Grid Input Power"
+        unique_id: solarflow_grid_input_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:transmission-tower
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('gridInputPower', none) %}
+            {% if val is not none %}
+              {{ [val | int, 0] | max }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── OFF-GRID POWER (per zenSDK: "Off-grid power") ──────────────────
+
+      - name: "SolarFlow Grid Off Power"
+        unique_id: solarflow_grid_off_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:transmission-tower-off
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('gridOffPower', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # BATTERY SYSTEM SENSORS
+      # ════════════════════════════════════════════════════════════════════
+
+      # ── BATTERY VOLTAGE ────────────────────────────────────────────────
+      # BatVolt (RO): "Battery voltage", unit 0.01V (per zenSDK docs)
+      # 4734 → 47.34V
+
+      - name: "SolarFlow Battery Voltage"
+        unique_id: solarflow_battery_voltage
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:flash-triangle
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('BatVolt', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(2) }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── NUMBER OF BATTERY PACKS ────────────────────────────────────────
+
+      - name: "SolarFlow Pack Count"
+        unique_id: solarflow_pack_count
+        icon: mdi:battery-plus-variant
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('packNum', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── PACK STATE (SYSTEM) ───────────────────────────────────────────
+      # packState (RO): "Pack state", range 0-2 (per zenSDK docs)
+      # 0=Standby, 1=Charging, 2=Discharging
+
+      - name: "SolarFlow Pack State"
+        unique_id: solarflow_pack_state
+        icon: mdi:battery-sync
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('packState', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Standby', 1: 'Charging', 2: 'Discharging'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # DEVICE & NETWORK SENSORS
+      # ════════════════════════════════════════════════════════════════════
+
+      # ── SIGNAL STRENGTH ───────────────────────────────────────────────
+      # rssi (RO): "Signal strength" (per zenSDK docs)
+
+      - name: "SolarFlow WiFi Signal"
+        unique_id: solarflow_wifi_rssi
+        unit_of_measurement: "dBm"
+        device_class: signal_strength
+        state_class: measurement
+        icon: mdi:wifi
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('rssi', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── REMAINING DISCHARGE TIME ───────────────────────────────────────
+      # remainOutTime (RO): "Remaining discharge time", unit min (per zenSDK docs)
+      # 59940 = sentinel for "not discharging".
+
+      - name: "SolarFlow Remaining Discharge Time"
+        unique_id: solarflow_remaining_discharge_time
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('remainOutTime', none) %}
+            {% if val is not none %}
+              {% if val | int >= 59940 %}
+                unavailable
+              {% else %}
+                {{ val | int }}
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── REMAINING CHARGE TIME ──────────────────────────────────────────
+
+      - name: "SolarFlow Remaining Charge Time"
+        unique_id: solarflow_remaining_charge_time
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('remainInputTime', none) %}
+            {% if val is not none %}
+              {% if val | int >= 59940 %}
+                unavailable
+              {% else %}
+                {{ val | int }}
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── FAN ────────────────────────────────────────────────────────────
+      # Fanmode (RW): 0=Off, 1=On (per zenSDK docs)
+
+      - name: "SolarFlow Fan Mode"
+        unique_id: solarflow_fan_mode
+        icon: mdi:fan
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('Fanmode', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Off', 1: 'On'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # Fanspeed (RW): 0=Auto, 1=Gear 1, 2=Gear 2 (per zenSDK docs)
+      - name: "SolarFlow Fan Speed"
+        unique_id: solarflow_fan_speed
+        icon: mdi:fan
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('Fanspeed', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Auto', 1: 'Gear 1', 2: 'Gear 2'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── ERROR STATE ────────────────────────────────────────────────────
+      # is_error (RO): "Error flag", range 0-1 (per zenSDK docs)
+      - name: "SolarFlow Error State"
+        unique_id: solarflow_error_state
+        icon: mdi:alert-circle
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('is_error', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} OK
+              {% else %} Error ({{ val }})
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # ── HEAT STATE (SYSTEM) ────────────────────────────────────────────
+
+      - name: "SolarFlow Heat State"
+        unique_id: solarflow_heat_state
+        icon: mdi:fire
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('heatState', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off
+              {% else %} Heating
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # STATUS FLAGS
+      # ════════════════════════════════════════════════════════════════════
+
+      # acStatus (RO): "AC state", range 0-2 (per zenSDK docs)
+      - name: "SolarFlow AC Status"
+        unique_id: solarflow_ac_status
+        icon: mdi:power-plug
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('acStatus', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Standby', 1: 'AC Input', 2: 'AC Charging'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # dcStatus (RO): "DC state", range 0-2 (per zenSDK docs)
+      - name: "SolarFlow DC Status"
+        unique_id: solarflow_dc_status
+        icon: mdi:current-dc
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('dcStatus', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # pvStatus (RO): "PV state", range 0-1 (per zenSDK docs)
+      - name: "SolarFlow PV Status"
+        unique_id: solarflow_pv_status
+        icon: mdi:solar-power
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('pvStatus', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} No PV
+              {% elif val | int == 1 %} PV Active
+              {% else %} Unknown ({{ val }})
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow Grid State"
+        unique_id: solarflow_grid_state
+        icon: mdi:transmission-tower
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('gridState', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off-Grid
+              {% elif val | int == 1 %} On-Grid
+              {% else %} Unknown ({{ val }})
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # IOTState (RO): "IoT connection" (per zenSDK docs)
+      - name: "SolarFlow IoT State"
+        unique_id: solarflow_iot_state
+        icon: mdi:cloud
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('IOTState', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Disconnected', 1: 'Connecting', 2: 'Connected'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # CONFIGURATION READBACK SENSORS
+      # ════════════════════════════════════════════════════════════════════
+      # Reflect current device settings — useful for verifying HA
+      # commands were accepted.
+
+      # acMode (RW): "Charge or discharge mode" (1-2, per zenSDK docs)
+      - name: "SolarFlow AC Mode"
+        unique_id: solarflow_ac_mode
+        icon: mdi:cog
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('acMode', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # smartMode (RW): "Flash write behavior" (per zenSDK docs)
+      # 0 = writes to flash, 1 = parameters not written to flash
+      # Device restores previous flash values after reboot
+      - name: "SolarFlow Smart Mode"
+        unique_id: solarflow_smart_mode
+        icon: mdi:memory
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('smartMode', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Flash
+              {% elif val | int == 1 %} RAM
+              {% else %} Unknown ({{ val }})
+              {% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # inverseMaxPower (RW): "Max inverter output" (per zenSDK docs)
+      - name: "SolarFlow Max Inverter Output"
+        unique_id: solarflow_inverse_max_power
+        unit_of_measurement: "W"
+        device_class: power
+        icon: mdi:speedometer
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('inverseMaxPower', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # inputLimit (RW): "AC charge limit" (per zenSDK docs)
+      - name: "SolarFlow AC Charge Limit"
+        unique_id: solarflow_input_limit
+        unit_of_measurement: "W"
+        device_class: power
+        icon: mdi:arrow-down-bold
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('inputLimit', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # chargeMaxLimit (RO): "Max charge power" (per zenSDK docs)
+      - name: "SolarFlow Max Charge Power"
+        unique_id: solarflow_charge_max_limit
+        unit_of_measurement: "W"
+        device_class: power
+        icon: mdi:battery-charging-high
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('chargeMaxLimit', none) %}
+            {% if val is not none %}
+              {{ val | int }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # socSet (RW): "Target SOC", unit % range 70-100 (per zenSDK docs)
+      # API value is in per-mille: 1000 = 100%
+      - name: "SolarFlow SoC Set"
+        unique_id: solarflow_soc_set
+        unit_of_measurement: "%"
+        icon: mdi:battery-arrow-up
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('socSet', none) %}
+            {% if val is not none %}
+              {{ (val | float / 10) | round(1) }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # minSoc (RW): "Minimum SOC", unit % range 0-50 (per zenSDK docs)
+      # API value is in per-mille: 50 = 5%
+      - name: "SolarFlow Min SoC"
+        unique_id: solarflow_min_soc
+        unit_of_measurement: "%"
+        icon: mdi:battery-arrow-down
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('minSoc', none) %}
+            {% if val is not none %}
+              {{ (val | float / 10) | round(1) }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # lampSwitch (RO): "Lamp state" (per zenSDK docs)
+      - name: "SolarFlow Lamp"
+        unique_id: solarflow_lamp_switch
+        icon: mdi:led-on
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('lampSwitch', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off{% else %} On{% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # pass (RO): "Pass-through state" (per zenSDK docs)
+      - name: "SolarFlow Pass-Through"
+        unique_id: solarflow_pass_through
+        icon: mdi:arrow-right-bold
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('pass', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off{% else %} On{% endif %}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # BATTERY PACK 1 SENSORS (packData[0])
+      # SN: CO4EHNCDN331097
+      # ════════════════════════════════════════════════════════════════════
+      # Requires "packData" in json_attributes of the REST sensor.
+
+      - name: "SolarFlow Pack 1 SoC"
+        unique_id: solarflow_pack1_soc
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('socLevel', none) %}
+            {% if val is not none %}{{ val | int }}{% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 1 Power"
+        unique_id: solarflow_pack1_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('power', none) %}
+            {% if val is not none %}{{ val | int }}{% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 1 State"
+        unique_id: solarflow_pack1_state
+        icon: mdi:battery-sync
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('state', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Standby', 1: 'Charging', 2: 'Discharging'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # maxTemp: 0.1K (zenSDK docs). 2971 → (2971 - 2731) / 10.0 = 24.0°C
+      - name: "SolarFlow Pack 1 Temperature"
+        unique_id: solarflow_pack1_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('maxTemp', none) %}
+            {% if val is not none %}
+              {{ ((val | float - 2731) / 10.0) | round(1) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # totalVol (RO): "Total voltage" (zenSDK docs list unit as V,
+      # but actual values are in 0.01V scale: 4730 → 47.30V)
+      - name: "SolarFlow Pack 1 Voltage"
+        unique_id: solarflow_pack1_voltage
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('totalVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(2) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # batcur (RO): "Battery current", unit A (per zenSDK docs)
+      # Raw 16-bit two's complement, current_A = value / 10.0
+      # Verified: 16 → 1.6A (75W / 47.3V ≈ 1.59A)
+      - name: "SolarFlow Pack 1 Current"
+        unique_id: solarflow_pack1_current
+        unit_of_measurement: "A"
+        device_class: current
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('batcur', none) %}
+            {% if val is not none %}
+              {{ (val | float / 10) | round(1) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # maxVol/minVol (RO): "Max/Min cell voltage", unit 0.01V (per zenSDK docs)
+      # 315 → 3.15V (correct for 7% SoC LFP, nominal 3.2V)
+      - name: "SolarFlow Pack 1 Max Cell Voltage"
+        unique_id: solarflow_pack1_max_cell_vol
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:arrow-up-bold
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('maxVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(3) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 1 Min Cell Voltage"
+        unique_id: solarflow_pack1_min_cell_vol
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:arrow-down-bold
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('minVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(3) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # Cell spread = imbalance indicator. Low = healthy.
+      # maxVol/minVol are in 0.01V units, so spread * 10 = mV.
+      - name: "SolarFlow Pack 1 Cell Imbalance"
+        unique_id: solarflow_pack1_cell_spread
+        unit_of_measurement: "mV"
+        icon: mdi:swap-vertical
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set mx = pd[0].get('maxVol', none) %}
+            {% set mn = pd[0].get('minVol', none) %}
+            {% if mx is not none and mn is not none %}
+              {{ (((mx | float) - (mn | float)) * 10) | round(0) | int }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 1 Serial"
+        unique_id: solarflow_pack1_serial
+        icon: mdi:identifier
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {{ pd[0].get('sn', 'unavailable') }}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 1 Heat State"
+        unique_id: solarflow_pack1_heat_state
+        icon: mdi:fire
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
+            {% set val = pd[0].get('heatState', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off{% else %} Heating{% endif %}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # BATTERY PACK 2 SENSORS (packData[1])
+      # SN: CO4ESNFRN360036
+      # ════════════════════════════════════════════════════════════════════
+
+      - name: "SolarFlow Pack 2 SoC"
+        unique_id: solarflow_pack2_soc
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('socLevel', none) %}
+            {% if val is not none %}{{ val | int }}{% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Power"
+        unique_id: solarflow_pack2_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('power', none) %}
+            {% if val is not none %}{{ val | int }}{% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 State"
+        unique_id: solarflow_pack2_state
+        icon: mdi:battery-sync
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('state', none) %}
+            {% if val is not none %}
+              {% set m = {0: 'Standby', 1: 'Charging', 2: 'Discharging'} %}
+              {{ m.get(val | int, 'Unknown (' ~ val ~ ')') }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Temperature"
+        unique_id: solarflow_pack2_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('maxTemp', none) %}
+            {% if val is not none %}
+              {{ ((val | float - 2731) / 10.0) | round(1) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Voltage"
+        unique_id: solarflow_pack2_voltage
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('totalVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(2) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Current"
+        unique_id: solarflow_pack2_current
+        unit_of_measurement: "A"
+        device_class: current
+        state_class: measurement
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('batcur', none) %}
+            {% if val is not none %}
+              {{ (val | float / 10) | round(1) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Max Cell Voltage"
+        unique_id: solarflow_pack2_max_cell_vol
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:arrow-up-bold
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('maxVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(3) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Min Cell Voltage"
+        unique_id: solarflow_pack2_min_cell_vol
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:arrow-down-bold
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('minVol', none) %}
+            {% if val is not none %}
+              {{ (val | float / 100) | round(3) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Cell Imbalance"
+        unique_id: solarflow_pack2_cell_spread
+        unit_of_measurement: "mV"
+        icon: mdi:swap-vertical
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set mx = pd[1].get('maxVol', none) %}
+            {% set mn = pd[1].get('minVol', none) %}
+            {% if mx is not none and mn is not none %}
+              {{ (((mx | float) - (mn | float)) * 10) | round(0) | int }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Serial"
+        unique_id: solarflow_pack2_serial
+        icon: mdi:identifier
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {{ pd[1].get('sn', 'unavailable') }}
+          {% else %}unavailable{% endif %}
+
+      - name: "SolarFlow Pack 2 Heat State"
+        unique_id: solarflow_pack2_heat_state
+        icon: mdi:fire
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
+            {% set val = pd[1].get('heatState', none) %}
+            {% if val is not none %}
+              {% if val | int == 0 %} Off{% else %} Heating{% endif %}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+
+      # ════════════════════════════════════════════════════════════════════
+      # CALCULATED / DERIVED SENSORS
+      # ════════════════════════════════════════════════════════════════════
+
+      # ── PACK TEMPERATURE DELTA ─────────────────────────────────────────
+      # Large deltas may indicate one pack is in direct sun or has a
+      # thermal issue.
+
+      - name: "SolarFlow Pack Temperature Delta"
+        unique_id: solarflow_pack_temp_delta
+        unit_of_measurement: "°C"
+        icon: mdi:thermometer-alert
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1
+              and pd[0] is mapping and pd[1] is mapping %}
+            {% set t1 = pd[0].get('maxTemp', none) %}
+            {% set t2 = pd[1].get('maxTemp', none) %}
+            {% if t1 is not none and t2 is not none %}
+              {{ (((t1 | float) - (t2 | float)) / 10) | abs | round(1) }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # ── PACK SOC DELTA ─────────────────────────────────────────────────
+      # Difference in charge level between the two packs.
+
+      - name: "SolarFlow Pack SoC Delta"
+        unique_id: solarflow_pack_soc_delta
+        unit_of_measurement: "%"
+        icon: mdi:battery-sync-outline
+        state: >
+          {% set pd = state_attr('sensor.solarflow_status_raw','packData') %}
+          {% if pd is iterable and pd | length > 1
+              and pd[0] is mapping and pd[1] is mapping %}
+            {% set s1 = pd[0].get('socLevel', none) %}
+            {% set s2 = pd[1].get('socLevel', none) %}
+            {% if s1 is not none and s2 is not none %}
+              {{ ((s1 | int) - (s2 | int)) | abs }}
+            {% else %}unavailable{% endif %}
+          {% else %}unavailable{% endif %}
+
+      # ── SYSTEM EFFICIENCY ──────────────────────────────────────────────
+      # (output + charge) / solar input — shows conversion losses.
+
+      - name: "SolarFlow System Efficiency"
+        unique_id: solarflow_system_efficiency
+        unit_of_measurement: "%"
+        icon: mdi:percent-circle
+        state: >
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set pv = p.get('solarInputPower', 0) | float %}
+            {% set out = p.get('outputHomePower', 0) | float %}
+            {# outputPackPower = power TO battery (charging) #}
+            {% set charge = p.get('outputPackPower', 0) | float %}
+            {% set total_used = out + charge %}
+            {% if pv > 10 %}
+              {{ ((total_used / pv) * 100) | round(1) }}
+            {% else %}
+              unavailable
+            {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+# ==============================================================================
+# ENERGY INTEGRATION SENSORS (W -> kWh)
+# ==============================================================================
+sensor:
+  - platform: integration
+    source: sensor.solarflow_solar_power_panel_1
+    name: "SolarFlow Panel 1 Energy"
+    unit_prefix: k
+    round: 3
+    method: left
+
+  - platform: integration
+    source: sensor.solarflow_solar_power_panel_2
+    name: "SolarFlow Panel 2 Energy"
+    unit_prefix: k
+    round: 3
+    method: left
+
+  - platform: integration
+    source: sensor.solarflow_solar_power_panel_3
+    name: "SolarFlow Panel 3 Energy"
+    unit_prefix: k
+    round: 3
+    method: left
+
+  - platform: integration
+    source: sensor.solarflow_solar_power_panel_4
+    name: "SolarFlow Panel 4 Energy"
+    unit_prefix: k
+    round: 3
+    method: left
+
+  - platform: integration
+    source: sensor.solarflow_output_home_power
+    name: "SolarFlow Output Home Energy"
+    unit_prefix: k
+    round: 3
+    method: left
+
+  - platform: integration
+    source: sensor.solarflow_grid_input_power
+    name: "SolarFlow Grid Input Energy"
+    unit_prefix: k
+    round: 3
+    method: left

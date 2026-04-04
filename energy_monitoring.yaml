@@ -1,0 +1,195 @@
+################################################################################
+#              SHELLY ENERGY MONITORING PACKAGE                                #
+################################################################################
+#
+# DESCRIPTION:
+# 3-phase power monitoring via Shelly Pro 3EM, with net import/export
+# calculation, consumption estimation (including solar generation),
+# and daily/monthly utility meters.
+#
+# Based on the original by zakazak / Utini2000.
+# Extended with configurable Shelly device IDs.
+#
+# SETUP:
+# Set the two input_text helpers below to match your Shelly entity IDs.
+# You can find these in Settings → Devices → (your Shelly) → Entities.
+#
+# The Shelly Pro 3EM entities follow the pattern:
+#   sensor.shellypro3em_<DEVICE_ID>_phase_a_active_power
+#   sensor.shellypro3em_<DEVICE_ID>_phase_b_active_power
+#   sensor.shellypro3em_<DEVICE_ID>_phase_c_active_power
+#
+# Only put the <DEVICE_ID> part in the input_text (e.g. "d890ewfh").
+#
+# If you have a separate Shelly PM Mini for solar generation, set its
+# full entity ID in the second input_text.
+#
+################################################################################
+
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+input_text:
+  # The device ID portion of your Shelly Pro 3EM entity IDs.
+  # Example: if your entities are sensor.shellypro3em_d890ewfh_phase_a_active_power
+  #          then set this to "d890ewfh"
+  shelly_3em_device_id:
+    name: "Shelly 3EM: Device ID"
+    icon: mdi:identifier
+    initial: "d890ewfh"
+    mode: text
+
+  # Full entity ID of the solar generation power sensor.
+  # Leave at "none" if you don't have a separate solar generation sensor.
+  # Example: "sensor.shellypmminig3_5432046f3b24_power"
+  shelly_solar_entity:
+    name: "Shelly Solar: Entity ID"
+    icon: mdi:solar-power-variant
+    initial: "sensor.shellypmminig3_5432046f3b24_power"
+    mode: text
+
+
+# ==============================================================================
+# 2. TEMPLATE SENSORS (3-PHASE NET IMPORT / EXPORT / CONSUMPTION)
+# ==============================================================================
+template:
+  - sensor:
+      # ── POWER IMPORT ───────────────────────────────────────────────────
+      # Sum of all 3 phases, only counting positive values (grid → house).
+      - name: "Power Import"
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set id = states('input_text.shelly_3em_device_id') %}
+          {% set a = states('sensor.shellypro3em_' ~ id ~ '_phase_a_active_power') | float(0) %}
+          {% set b = states('sensor.shellypro3em_' ~ id ~ '_phase_b_active_power') | float(0) %}
+          {% set c = states('sensor.shellypro3em_' ~ id ~ '_phase_c_active_power') | float(0) %}
+          {% set total = a + b + c %}
+          {{ total if total > 0 else 0 }}
+        availability: >-
+          {% set id = states('input_text.shelly_3em_device_id') %}
+          {% set sensors = [
+            states('sensor.shellypro3em_' ~ id ~ '_phase_a_active_power') | float(none),
+            states('sensor.shellypro3em_' ~ id ~ '_phase_b_active_power') | float(none),
+            states('sensor.shellypro3em_' ~ id ~ '_phase_c_active_power') | float(none)
+          ] %}
+          {{ sensors | select('is_number') | list | count == 3 }}
+
+      # ── POWER EXPORT ───────────────────────────────────────────────────
+      # Sum of all 3 phases, only counting negative values (house → grid).
+      # Reported as a positive number.
+      - name: "Power Export"
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set id = states('input_text.shelly_3em_device_id') %}
+          {% set a = states('sensor.shellypro3em_' ~ id ~ '_phase_a_active_power') | float(0) %}
+          {% set b = states('sensor.shellypro3em_' ~ id ~ '_phase_b_active_power') | float(0) %}
+          {% set c = states('sensor.shellypro3em_' ~ id ~ '_phase_c_active_power') | float(0) %}
+          {% set total = a + b + c %}
+          {{ (total * -1) if total < 0 else 0 }}
+        availability: >-
+          {% set id = states('input_text.shelly_3em_device_id') %}
+          {% set sensors = [
+            states('sensor.shellypro3em_' ~ id ~ '_phase_a_active_power') | float(none),
+            states('sensor.shellypro3em_' ~ id ~ '_phase_b_active_power') | float(none),
+            states('sensor.shellypro3em_' ~ id ~ '_phase_c_active_power') | float(none)
+          ] %}
+          {{ sensors | select('is_number') | list | count == 3 }}
+
+      # ── POWER CONSUMPTION ──────────────────────────────────────────────
+      # Estimates real household consumption by combining grid flow with
+      # solar generation. Applies a small tolerance (2 W when solar < 100 W)
+      # to suppress jitter from sensor timing differences.
+      #
+      # NOTE: This sensor assumes the Shelly PM Mini reports solar power
+      # as a NEGATIVE value. If your device reports it as positive,
+      # remove the "* -1" on the solar_val line.
+      - name: "Power Consumption"
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set import_val = states('sensor.power_import') | float(0) %}
+          {% set export_val = states('sensor.power_export') | float(0) %}
+          {% set solar_entity = states('input_text.shelly_solar_entity') %}
+          {% if solar_entity not in ['none', 'unknown', 'unavailable', ''] %}
+            {% set solar_val = (states(solar_entity) | float(0)) * -1 %}
+          {% else %}
+            {% set solar_val = 0 %}
+          {% endif %}
+          {% set delta = solar_val - export_val %}
+          {% set tolerance = 2.0 if solar_val < 100 else 0 %}
+          {% if delta < -tolerance %}
+            {{ import_val + solar_val }}
+          {% elif delta > tolerance %}
+            {{ delta }}
+          {% elif abs(delta) <= tolerance %}
+            {{ 0 }}
+          {% else %}
+            {{ import_val + solar_val }}
+          {% endif %}
+
+
+# ==============================================================================
+# 3. INTEGRATION SENSORS (W → kWh)
+# ==============================================================================
+sensor:
+  - platform: integration
+    source: sensor.power_import
+    name: energy_import_sum
+    unit_prefix: k
+    round: 4
+    method: left
+
+  - platform: integration
+    source: sensor.power_export
+    name: energy_export_sum
+    unit_prefix: k
+    round: 4
+    method: left
+
+  - platform: integration
+    source: sensor.power_consumption
+    name: energy_consumption_sum
+    unit_prefix: k
+    round: 4
+    method: left
+
+
+# ==============================================================================
+# 4. UTILITY METERS (DAILY / MONTHLY TRACKING)
+# ==============================================================================
+utility_meter:
+  energy_import_daily:
+    source: sensor.energy_import_sum
+    name: Energy Import Daily
+    cycle: daily
+
+  energy_import_monthly:
+    source: sensor.energy_import_sum
+    name: Energy Import Monthly
+    cycle: monthly
+
+  energy_export_daily:
+    source: sensor.energy_export_sum
+    name: Energy Export Daily
+    cycle: daily
+
+  energy_export_monthly:
+    source: sensor.energy_export_sum
+    name: Energy Export Monthly
+    cycle: monthly
+
+  energy_consumption_daily:
+    source: sensor.energy_consumption_sum
+    name: Energy Consumption Daily
+    cycle: daily
+
+  energy_consumption_monthly:
+    source: sensor.energy_consumption_sum
+    name: Energy Consumption Monthly
+    cycle: monthly
