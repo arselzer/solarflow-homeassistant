@@ -1,0 +1,417 @@
+################################################################################
+#               ZENDURE SOLARFLOW - DEVICE 2 PACKAGE                           #
+################################################################################
+#
+# DESCRIPTION:
+# Second SolarFlow device. Self-contained: IP helper, REST sensor, core
+# derived sensors, kWh integration sensors, state machine, flash protection,
+# logic manager. No control loop — that's handled by the coordinator
+# (zendure_coordinator.yaml) which supersedes the solo loop in zendure.yaml
+# when input_boolean.zendure_coordinator_enabled is on.
+#
+# DESIGN NOTES:
+# - Entity names use `_2` / `solarflow_2_` suffixes. Device 1 keeps its
+#   original unnumbered names for backward compatibility.
+# - Only 6 core derived sensors are declared here. For full extended-sensor
+#   parity with device 1, copy zendure_extended.yaml and replace
+#   solarflow_status_raw → solarflow_2_status_raw and add a `_2` prefix to
+#   each unique_id and name.
+# - The seasonal switch (SoC cutoff / grid bias / saturation) lives in
+#   device 1's Logic Manager and is applied globally; we don't duplicate it.
+#
+# SETUP:
+# 1. Copy this file into packages/
+# 2. Set input_text.zendure_device_2_ip (below or via HA UI).
+# 3. Install zendure_coordinator.yaml and flip zendure_coordinator_enabled on.
+#
+################################################################################
+
+
+# ==============================================================================
+# 1. CONFIGURATION (DEVICE 2 HELPERS)
+# ==============================================================================
+input_text:
+  zendure_device_2_ip:
+    name: "Zendure 2: Device IP Address"
+    icon: mdi:ip-network
+    initial: "192.168.30.92"
+    pattern: "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+    mode: text
+
+input_boolean:
+  # Participation flag for the coordinator. Flip off to temporarily remove
+  # device 2 from the active set without changing its IP or powering it off.
+  zendure_2_enabled:
+    name: "Zendure 2: Device Enabled"
+    icon: mdi:power
+    initial: true
+
+  zendure_2_emergency_charge:
+    name: "Zendure 2: Emergency Charging"
+    icon: mdi:battery-alert
+    initial: false
+
+  zendure_2_calibration_mode:
+    name: "Zendure 2: Calibration Running"
+    icon: mdi:battery-sync
+    initial: false
+
+input_datetime:
+  zendure_2_last_full_charge:
+    name: "Zendure 2: Last 100% Charge At"
+    has_date: true
+    has_time: true
+
+input_number:
+  zendure_2_last_sent_limit:
+    name: "Zendure 2: Last Sent Value"
+    min: -2
+    max: 1200
+    step: 1
+    mode: box
+
+
+# ==============================================================================
+# 2. REST SENSOR (DEVICE 2)
+# ==============================================================================
+rest:
+  - resource_template: >-
+      http://{{ states('input_text.zendure_device_2_ip') }}/properties/report
+    scan_interval: 15
+    timeout: 30
+    sensor:
+      - name: "SolarFlow 2 Status Raw"
+        unique_id: solarflow_2_status_raw
+        value_template: >-
+          {% if value_json is defined and value_json.properties is defined %}
+            OK
+          {% else %}
+            unavailable
+          {% endif %}
+        json_attributes:
+          - sn
+          - properties
+          - packData
+
+
+# ==============================================================================
+# 3. CORE DERIVED SENSORS (6 sensors — enough for coordinator + dashboard)
+# ==============================================================================
+template:
+  - sensor:
+      - name: "SolarFlow 2 Battery Level"
+        unique_id: solarflow_2_battery_level
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {{ p.get('electricLevel', 0) | int }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow 2 Output Limit"
+        unique_id: solarflow_2_output_limit
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {{ p.get('outputLimit', 0) | int }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow 2 Solar Input"
+        unique_id: solarflow_2_solar_input
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set val = p.get('solarInputPower', 0) | int %}
+            {{ [val, 0] | max }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow 2 Enclosure Temp"
+        unique_id: solarflow_2_device_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >-
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set raw = p.get('hyperTmp', 2931) | int %}
+            {{ ((raw - 2731) / 10.0) | round(1) }}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      # Same input/output swap as device 1 — verified on SF 800 Pro firmware.
+      - name: "SolarFlow 2 Pack Input Power"
+        unique_id: solarflow_2_pack_input_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set in_raw = [p.get('outputPackPower', 0)|int, 0] | max %}
+            {% set out_raw = [p.get('packInputPower', 0)|int, 0] | max %}
+            {% set net = in_raw - out_raw %}
+            {% if net > 0 %} {{ net }} {% else %} 0 {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+      - name: "SolarFlow 2 Pack Output Power"
+        unique_id: solarflow_2_pack_output_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set in_raw = [p.get('outputPackPower', 0)|int, 0] | max %}
+            {% set out_raw = [p.get('packInputPower', 0)|int, 0] | max %}
+            {% set net = in_raw - out_raw %}
+            {% if net < 0 %} {{ net | abs }} {% else %} 0 {% endif %}
+          {% else %}
+            unavailable
+          {% endif %}
+
+
+# ==============================================================================
+# 4. INTEGRATION SENSORS (W → kWh)
+# ==============================================================================
+sensor:
+  - platform: integration
+    source: sensor.solarflow_2_solar_input
+    name: "SolarFlow 2 Solar Energy Total"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.solarflow_2_pack_input_power
+    name: "SolarFlow 2 Battery Energy Charged"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.solarflow_2_pack_output_power
+    name: "SolarFlow 2 Battery Energy Discharged"
+    unit_prefix: k
+    round: 3
+    method: left
+
+
+# ==============================================================================
+# 5. STATE MACHINE (DEVICE 2)
+# ==============================================================================
+# Mirrors the device-1 state machine. Fires when device-2 emergency/calibration
+# booleans toggle. Writes to device 2's own IP/SN via the generic rest_command.
+automation:
+  - alias: "Zendure 2: State Machine"
+    id: "zendure_2_state_machine"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id:
+          - input_boolean.zendure_2_emergency_charge
+          - input_boolean.zendure_2_calibration_mode
+    condition:
+      - condition: template
+        value_template: "{{ state_attr('sensor.solarflow_2_status_raw','sn') is not none }}"
+    action:
+      - choose:
+          - conditions: >
+              {{ is_state('input_boolean.zendure_2_emergency_charge','on')
+                 or is_state('input_boolean.zendure_2_calibration_mode','on') }}
+            sequence:
+              - service: rest_command.zendure_force_charge_for
+                data:
+                  ip: "{{ states('input_text.zendure_device_2_ip') }}"
+                  sn: "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
+                  limit: "{{ states('input_number.zendure_conf_emergency_watt')|int }}"
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_2_last_sent_limit
+                data:
+                  value: -2
+
+          - conditions: >
+              {{ is_state('input_boolean.zendure_2_emergency_charge','off')
+                 and is_state('input_boolean.zendure_2_calibration_mode','off') }}
+            sequence:
+              - service: rest_command.zendure_set_output_for
+                data:
+                  ip: "{{ states('input_text.zendure_device_2_ip') }}"
+                  sn: "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
+                  limit: 0
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_2_last_sent_limit
+                data:
+                  value: 0
+
+
+# ==============================================================================
+# 6. LOGIC MANAGER (DEVICE 2 — emergency + calibration checks only)
+# ==============================================================================
+# Seasonal settings live in device 1's Logic Manager and are shared globally.
+  - alias: "Zendure 2: Track 100% Charge"
+    id: "zendure_2_track_100_percent"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.solarflow_2_battery_level
+        above: 99
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.zendure_2_last_full_charge
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  - alias: "Zendure 2: Logic Manager"
+    id: "zendure_2_logic_manager"
+    trigger:
+      - platform: time
+        at: "00:00:00"
+      - platform: time_pattern
+        minutes: "/10"
+      - platform: state
+        entity_id: sensor.solarflow_2_battery_level
+    action:
+      # Emergency charge check
+      - variables:
+          bat: "{{ states('sensor.solarflow_2_battery_level')|float(0) }}"
+          start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
+          stop_lim: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
+          thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ bat < start_lim }}"
+              - condition: template
+                value_template: "{{ forecast < thresh or bat < 3 }}"
+              - condition: state
+                entity_id: input_boolean.zendure_2_emergency_charge
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.zendure_2_emergency_charge
+          - conditions:
+              - condition: template
+                value_template: "{{ bat > stop_lim }}"
+              - condition: state
+                entity_id: input_boolean.zendure_2_emergency_charge
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.zendure_2_emergency_charge
+
+      # Calibration check
+      - variables:
+          days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
+          last_run: "{{ states('input_datetime.zendure_2_last_full_charge') }}"
+          days_diff: >
+            {% if last_run not in ['unknown', 'unavailable'] %}
+              {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
+            {% else %} 999 {% endif %}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ days_diff | float >= days_threshold }}"
+              - condition: state
+                entity_id: input_boolean.zendure_2_calibration_mode
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.zendure_2_calibration_mode
+              - service: persistent_notification.create
+                data:
+                  title: "Zendure 2 Cell Maintenance"
+                  message: "Starting calibration ({{ days_diff | int }} days without full charge)."
+          - conditions:
+              - condition: template
+                value_template: "{{ bat >= 100 }}"
+              - condition: state
+                entity_id: input_boolean.zendure_2_calibration_mode
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.zendure_2_calibration_mode
+              - service: persistent_notification.create
+                data:
+                  title: "Zendure 2 Calibration"
+                  message: "Complete (100% reached)."
+
+
+# ==============================================================================
+# 7. FLASH PROTECTION (DEVICE 2)
+# ==============================================================================
+  - alias: "Zendure 2: Flash Protection (smartMode=RAM)"
+    id: "zendure_2_flash_protection"
+    trigger:
+      - platform: state
+        entity_id: sensor.solarflow_2_status_raw
+        to: "OK"
+    condition:
+      - condition: template
+        value_template: >
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {{ p is mapping and p.get('smartMode', 0) | int == 0 }}
+      - condition: template
+        value_template: "{{ state_attr('sensor.solarflow_2_status_raw','sn') is not none }}"
+    action:
+      - delay: "00:00:10"
+      - service: rest_command.zendure_set_property_for
+        data:
+          ip: "{{ states('input_text.zendure_device_2_ip') }}"
+          payload: >
+            {
+              "properties": { "smartMode": 1 },
+              "sn": "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
+            }
+      - service: persistent_notification.create
+        data:
+          title: "Zendure 2 Flash Protection"
+          message: "smartMode set to RAM (1). Flash wear protection active."
+          notification_id: "zendure_2_smartmode"
+
+
+# ==============================================================================
+# 8. DEVICE OFFLINE MONITORING
+# ==============================================================================
+  - alias: "Zendure 2: Device Offline Warning"
+    id: "zendure_2_device_offline_warning"
+    trigger:
+      - platform: template
+        value_template: "{{ states('sensor.solarflow_2_status_raw') != 'OK' }}"
+        for: "00:00:30"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️ Zendure Device 2 Offline"
+          message: >-
+            SolarFlow at {{ states('input_text.zendure_device_2_ip') }} isn't
+            responding. The coordinator will exclude it from allocation until
+            it comes back; other devices will pick up its share.
+          notification_id: "zendure_2_device_offline"
+
+  - alias: "Zendure 2: Device Recovery Notice"
+    id: "zendure_2_device_recovery_notice"
+    trigger:
+      - platform: state
+        entity_id: sensor.solarflow_2_status_raw
+        to: "OK"
+        for: "00:00:10"
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: "zendure_2_device_offline"

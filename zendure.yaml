@@ -50,7 +50,15 @@ input_boolean:
     name: "Zendure Auto Mode Active"
     icon: mdi:robot
     initial: true
-  
+
+  # Device-1 participation flag for the multi-device coordinator. Solo mode
+  # ignores this entirely — leave it on. In coordinator mode, flipping it off
+  # removes device 1 from the active set (useful during maintenance).
+  zendure_enabled:
+    name: "Zendure: Device 1 Enabled"
+    icon: mdi:power
+    initial: true
+
   zendure_emergency_charge:
     name: "Status: Emergency Charging"
     icon: mdi:battery-alert
@@ -379,6 +387,45 @@ rest_command:
     payload: >
       {{ payload }}
 
+  # --- GENERIC PER-DEVICE WRITERS (used by the multi-device coordinator) ------
+  # These take ip/sn/limit as template args so one command covers N devices.
+  # Single-device users never invoke these; they remain harmless additions.
+  zendure_set_output_for:
+    url: "http://{{ ip }}/properties/write"
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {
+        "properties": {
+          "outputLimit": {{ limit | int }},
+          "chargeMaxLimit": 0
+        },
+        "sn": "{{ sn }}"
+      }
+
+  zendure_force_charge_for:
+    url: "http://{{ ip }}/properties/write"
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {
+        "properties": {
+          "outputLimit": 0,
+          "chargeMaxLimit": {{ limit | int }}
+        },
+        "sn": "{{ sn }}"
+      }
+
+  zendure_set_property_for:
+    url: "http://{{ ip }}/properties/write"
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {{ payload }}
+
 
 # ==============================================================================
 # 5. AUTOMATION A: STATE MACHINE
@@ -436,8 +483,12 @@ automation:
     trigger:
       - platform: time_pattern
         seconds: "/5"
-    
+
     condition:
+      # Multi-device coordinator (if installed) supersedes the solo loop.
+      # Template form tolerates the helper not existing (single-device setup).
+      - condition: template
+        value_template: "{{ not is_state('input_boolean.zendure_coordinator_enabled', 'on') }}"
       - condition: state
         entity_id: input_boolean.zendure_auto_mode
         state: "on"
@@ -807,3 +858,31 @@ automation:
       - service: persistent_notification.dismiss
         data:
           notification_id: "zendure_failsafe_alert"
+
+  - alias: "Zendure 1: Device Offline Warning"
+    id: "zendure_1_device_offline_warning"
+    trigger:
+      - platform: template
+        value_template: "{{ states('sensor.solarflow_status_raw') != 'OK' }}"
+        for: "00:00:30"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️ Zendure Device 1 Offline"
+          message: >-
+            SolarFlow at {{ states('input_text.zendure_device_ip') }} isn't
+            responding. The control loop will skip writes to this device
+            until it comes back.
+          notification_id: "zendure_1_device_offline"
+
+  - alias: "Zendure 1: Device Recovery Notice"
+    id: "zendure_1_device_recovery_notice"
+    trigger:
+      - platform: state
+        entity_id: sensor.solarflow_status_raw
+        to: "OK"
+        for: "00:00:10"
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: "zendure_1_device_offline"

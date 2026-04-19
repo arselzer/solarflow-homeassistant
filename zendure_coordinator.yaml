@@ -1,0 +1,727 @@
+################################################################################
+#             ZENDURE SOLARFLOW - MULTI-DEVICE COORDINATOR                     #
+################################################################################
+#
+# DESCRIPTION:
+# Coordinates N ≥ 1 SolarFlow devices sharing one grid meter. When
+# input_boolean.zendure_coordinator_enabled is on, this loop supersedes the
+# solo control loop in zendure.yaml and distributes the aggregate target
+# across devices by the selected allocation strategy.
+#
+# REQUIRES:
+#   - zendure.yaml           (device 1 + generic rest_commands + gate)
+#   - zendure_device2.yaml   (device 2 sensors + state machine)
+#   - energy_monitoring.yaml (Shelly grid sensors)
+#
+# HOW IT GENERALISES TO MORE DEVICES:
+# The `devices` list in the control loop is the single source of truth. To
+# add a third device: create a zendure_device3.yaml (copy of the device-2
+# package with `_3` suffixes), then append one more dict to the `devices`
+# list below. Allocation logic is N-agnostic.
+#
+# BEHAVIOR AT N=1:
+# If device 2's REST sensor is unavailable (helper unset or device offline),
+# it drops out of the active set. The coordinator collapses to single-device
+# operation that's equivalent to the solo loop — so enabling the coordinator
+# without a second device is safe.
+#
+# ALLOCATION STRATEGIES (input_select.zendure_allocation_strategy):
+#   priority_by_soc           Highest-SoC device fully loaded first. True
+#                             SoC ties share equally.
+#   priority_by_soc_bucketed  Same, but SoCs within ~2% of each other share.
+#                             Default — prevents cross-over oscillation.
+#   equal_split               All active devices share the target equally,
+#                             regardless of SoC.
+#
+# All three share a single water-fill algorithm; the strategy only changes
+# which devices end up in the same "bucket". Each device's contribution is
+# capped per-device for winter protection, empty battery, and bypass mode
+# — matching the solo loop's semantics.
+#
+################################################################################
+
+
+# ==============================================================================
+# 1. HELPERS (COORDINATOR SWITCH + ALLOCATION STRATEGY)
+# ==============================================================================
+input_boolean:
+  zendure_coordinator_enabled:
+    name: "Zendure: Multi-Device Coordinator Active"
+    icon: mdi:lan-connect
+    initial: false
+
+  # When on, the coordinator computes allocations as usual and fires the
+  # diagnostic event, but skips the actual REST writes + last_sent updates.
+  # Lets you validate a new multi-device install by watching the share
+  # sensors react to real grid data before trusting the loop with writes.
+  zendure_dry_run:
+    name: "Zendure: Dry-Run Mode"
+    icon: mdi:test-tube
+    initial: false
+
+input_datetime:
+  # Stamped at the end of every coordinator cycle. Used by
+  # sensor.zendure_seconds_since_last_tick to detect a frozen loop.
+  zendure_last_tick:
+    name: "Zendure: Last Coordinator Tick"
+    has_date: true
+    has_time: true
+
+input_select:
+  zendure_allocation_strategy:
+    name: "Zendure: Allocation Strategy"
+    icon: mdi:scale-balance
+    options:
+      # Strict priority. High-SoC device fully loaded before the next one
+      # contributes. True SoC ties share equally.
+      - priority_by_soc
+      # Bucketed priority with 2% SoC deadband — prevents oscillation between
+      # devices whose SoC crosses over within a bucket. Recommended default.
+      - priority_by_soc_bucketed
+      # All active devices treated as one bucket: target is divided equally,
+      # water-filled for cap constraints. Ignores SoC for allocation.
+      - equal_split
+    initial: priority_by_soc_bucketed
+
+
+# ==============================================================================
+# 2. COORDINATOR CONTROL LOOP
+# ==============================================================================
+automation:
+  - alias: "Zendure: Multi-Device Coordinator"
+    id: "zendure_multi_coordinator"
+    mode: restart
+    trigger:
+      - platform: time_pattern
+        seconds: "/5"
+
+    condition:
+      - condition: state
+        entity_id: input_boolean.zendure_coordinator_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.zendure_auto_mode
+        state: "on"
+
+    action:
+      # ------------------------------------------------------------------
+      # Phase 1: gather global state and per-device state.
+      # Add more devices by appending entries to the `devices` list.
+      # ------------------------------------------------------------------
+      - variables:
+          shelly_ok: >
+            {{ states('sensor.power_import') | is_number
+               and states('sensor.power_export') | is_number }}
+          grid_power: >
+            {% if states('sensor.power_import') | is_number
+               and states('sensor.power_export') | is_number %}
+              {{ states('sensor.power_import') | float(0)
+                 - states('sensor.power_export') | float(0) }}
+            {% else %} 0 {% endif %}
+
+          max_output: "{{ states('input_number.zendure_conf_max_output') | int }}"
+          failsafe_watt: "{{ states('input_number.zendure_conf_failsafe_watt') | int }}"
+          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt') | int }}"
+          hysteresis_watt: "{{ states('input_number.zendure_conf_hysteresis') | int }}"
+          grid_bias: "{{ states('input_number.zendure_conf_grid_bias') | int }}"
+          soc_off: "{{ states('input_number.zendure_conf_soc_off') | int }}"
+          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
+          emergency_watt: "{{ states('input_number.zendure_conf_emergency_watt') | int }}"
+
+          devices:
+            - id: 1
+              ip: "{{ states('input_text.zendure_device_ip') }}"
+              sn: "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
+              ok: >-
+                {{ states('sensor.solarflow_status_raw') == 'OK'
+                   and state_attr('sensor.solarflow_status_raw', 'sn') is not none }}
+              enabled: >-
+                {{ is_state('input_boolean.zendure_enabled', 'on')
+                   or not states('input_boolean.zendure_enabled') in ['on', 'off'] }}
+              battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
+              current_limit: "{{ states('sensor.solarflow_output_limit') | float(0) }}"
+              solar: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
+              temp: "{{ states('sensor.solarflow_enclosure_temp') | float(20) }}"
+              last_sent: "{{ states('input_number.zendure_last_sent_limit') | int }}"
+              force_charge: >-
+                {{ is_state('input_boolean.zendure_emergency_charge', 'on')
+                   or is_state('input_boolean.zendure_calibration_mode', 'on') }}
+              last_sent_entity: "input_number.zendure_last_sent_limit"
+            - id: 2
+              ip: "{{ states('input_text.zendure_device_2_ip') }}"
+              sn: "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
+              ok: >-
+                {{ states('sensor.solarflow_2_status_raw') == 'OK'
+                   and state_attr('sensor.solarflow_2_status_raw', 'sn') is not none }}
+              enabled: >-
+                {{ is_state('input_boolean.zendure_2_enabled', 'on')
+                   or not states('input_boolean.zendure_2_enabled') in ['on', 'off'] }}
+              battery: "{{ states('sensor.solarflow_2_battery_level') | float(0) }}"
+              current_limit: "{{ states('sensor.solarflow_2_output_limit') | float(0) }}"
+              solar: "{{ states('sensor.solarflow_2_solar_input') | float(0) }}"
+              temp: "{{ states('sensor.solarflow_2_enclosure_temp') | float(20) }}"
+              last_sent: "{{ states('input_number.zendure_2_last_sent_limit') | int }}"
+              force_charge: >-
+                {{ is_state('input_boolean.zendure_2_emergency_charge', 'on')
+                   or is_state('input_boolean.zendure_2_calibration_mode', 'on') }}
+              last_sent_entity: "input_number.zendure_2_last_sent_limit"
+
+      # ------------------------------------------------------------------
+      # Phase 2: per-device drift correction (self-healing memory).
+      # If a device's last-sent memory has diverged > 150 W from reality,
+      # resync to the reported outputLimit.
+      # ------------------------------------------------------------------
+      - repeat:
+          for_each: "{{ devices }}"
+          sequence:
+            - variables:
+                d: "{{ repeat.item }}"
+                is_drifting: >-
+                  {{ d.last_sent >= 0
+                     and (d.last_sent - d.current_limit) | abs > 150 }}
+            - if:
+                - condition: template
+                  value_template: "{{ d.ok and is_drifting }}"
+              then:
+                - service: input_number.set_value
+                  target:
+                    entity_id: "{{ d.last_sent_entity }}"
+                  data:
+                    value: "{{ d.current_limit | int }}"
+
+      # ------------------------------------------------------------------
+      # Phase 3: derive base_value per device, aggregate, compute target.
+      # We can't re-read input_number here (writes are async), so we recompute
+      # base_value from the same inputs we just corrected.
+      # ------------------------------------------------------------------
+      - variables:
+          devices_ext: >
+            {% set ns = namespace(out=[]) %}
+            {% for d in devices %}
+              {% set is_drifting = d.last_sent >= 0
+                 and (d.last_sent - d.current_limit) | abs > 150 %}
+              {% set base = d.current_limit
+                 if (d.last_sent < 0 or is_drifting) else d.last_sent %}
+              {% set ns.out = ns.out + [d | combine({'base': base | int})] %}
+            {% endfor %}
+            {{ ns.out }}
+
+          actives: >-
+            {{ devices_ext
+               | selectattr('ok')
+               | selectattr('enabled')
+               | rejectattr('force_charge')
+               | list }}
+          active_count: "{{ actives | length }}"
+          any_ok: >-
+            {{ devices_ext
+               | selectattr('ok')
+               | selectattr('enabled')
+               | list | length > 0 }}
+          # Only count force-charging devices that are both ok AND enabled.
+          # A disabled device's AC draw (if any) is treated as an unknown
+          # external load — the coordinator lets the active set cover it.
+          force_charge_count: >-
+            {{ devices_ext
+               | selectattr('ok')
+               | selectattr('enabled')
+               | selectattr('force_charge')
+               | list | length }}
+
+          # Compensate grid_power for the known AC draw of force-charging
+          # devices, so the active set doesn't try to cover their intake.
+          adjusted_grid_power: >-
+            {{ grid_power - (force_charge_count | int * emergency_watt) }}
+
+          base_value_total: >-
+            {{ actives | sum(attribute='base') | int }}
+          active_pv_total: >-
+            {{ actives | sum(attribute='solar') | float(0) }}
+          all_active_full: >-
+            {% if actives | length == 0 %}
+              false
+            {% else %}
+              {{ actives | selectattr('battery', '>', 98) | list | length
+                 == actives | length }}
+            {% endif %}
+
+      - variables:
+          # -1  → abort (no writes this tick)
+          # >=0 → target total that will be distributed across active devices
+          target_total: >-
+            {% if not any_ok or active_count | int == 0 %}
+              -1
+            {% elif not shelly_ok %}
+              {# Failsafe: each active device gets failsafe_watt #}
+              {{ failsafe_watt | int * active_count | int }}
+            {% else %}
+              {% set t = base_value_total | int
+                       + adjusted_grid_power | float(0)
+                       - grid_bias | int %}
+              {% if all_active_full and active_pv_total
+                     > saturation_watt | int * active_count | int %}
+                {% set t = [t, saturation_watt | int * active_count | int] | max %}
+              {% endif %}
+              {% set t = [t, 0] | max %}
+              {% set t = [t, max_output | int * active_count | int] | min %}
+              {{ t | int }}
+            {% endif %}
+          is_failsafe: >-
+            {{ any_ok and active_count | int > 0 and not shelly_ok }}
+
+      # ------------------------------------------------------------------
+      # Phase 4a: pre-compute per-device cap and bucket key.
+      # The cap handles winter / empty / bypass / normal constraints.
+      # The bucket key selects which devices share allocation equally;
+      # it's derived from the selected strategy:
+      #
+      #   equal_split              → every device in bucket 0 (all share).
+      #   priority_by_soc_bucketed → bucket = ((max_soc - soc) / 2) | int.
+      #                              Devices within ~2% SoC of each other
+      #                              share; buckets step away from the max.
+      #   priority_by_soc          → bucket = ((max_soc - soc) * 100) | int.
+      #                              True ties share; anything else gets
+      #                              a unique bucket (strict priority).
+      #
+      # Lower bucket key = higher priority (groupby sorts ascending).
+      # ------------------------------------------------------------------
+      - variables:
+          strategy: "{{ states('input_select.zendure_allocation_strategy') }}"
+          max_active_battery: >-
+            {% if actives | length > 0 %}
+              {{ actives | map(attribute='battery') | map('float', 0) | max }}
+            {% else %} 0 {% endif %}
+          actives_capped: >
+            {% set ns = namespace(out=[]) %}
+            {% for d in actives %}
+              {% if d.temp | float(20) < 0 and d.solar | float(0) < 100 %}
+                {% set cap = 0 %}
+              {% elif d.battery | float(0) <= soc_off | int %}
+                {% set cap = 0 %}
+              {% elif d.battery | float(0) <= soc_bypass | int %}
+                {% set cap = [((d.solar | float(0)) * 0.9) | int,
+                              max_output | int] | min %}
+              {% else %}
+                {% set cap = max_output | int %}
+              {% endif %}
+              {% if strategy == 'equal_split' %}
+                {% set bucket = 0 %}
+              {% elif strategy == 'priority_by_soc' %}
+                {% set bucket = ((max_active_battery | float(0)
+                                  - d.battery | float(0)) * 100) | int %}
+              {% else %}
+                {# priority_by_soc_bucketed — default #}
+                {% set bucket = ((max_active_battery | float(0)
+                                  - d.battery | float(0)) / 2) | int %}
+              {% endif %}
+              {% set ns.out = ns.out
+                 + [d | combine({'cap': cap, 'bucket': bucket})] %}
+            {% endfor %}
+            {{ ns.out }}
+
+      # ------------------------------------------------------------------
+      # Phase 4b: water-fill allocation by bucket.
+      # Walk buckets lowest-key-first (= highest priority first); within
+      # each bucket process devices smallest-cap-first and assign each
+      # the fair share of the bucket's remaining allocation, clamped by
+      # its cap. Any surplus from a capped device flows to devices with
+      # more headroom — so a single weak device doesn't strand capacity.
+      # Failsafe still bypasses bucketing: each active device gets the
+      # configured failsafe_watt directly.
+      # ------------------------------------------------------------------
+      - variables:
+          allocations: >
+            {% if (target_total | int) < 0 or active_count | int == 0 %}
+              []
+            {% elif is_failsafe %}
+              {% set ns = namespace(out=[]) %}
+              {% for d in actives_capped %}
+                {% set ns.out = ns.out + [{
+                  'id': d.id, 'ip': d.ip, 'sn': d.sn,
+                  'limit': failsafe_watt | int, 'base': d.base,
+                  'last_sent_entity': d.last_sent_entity
+                }] %}
+              {% endfor %}
+              {{ ns.out }}
+            {% else %}
+              {% set ns = namespace(remaining=target_total | int, out=[]) %}
+              {% for _k, members in actives_capped | groupby('bucket') %}
+                {% set members = members | list %}
+                {% set bucket_cap = members | sum(attribute='cap') %}
+                {% set bucket_share =
+                     [[ns.remaining, bucket_cap] | min, 0] | max %}
+                {% set sorted_m = members | sort(attribute='cap') %}
+                {% set ns2 = namespace(br=bucket_share,
+                                       un=(sorted_m | length)) %}
+                {% for m in sorted_m %}
+                  {% set fair = (ns2.br / ns2.un) | int
+                                if ns2.un > 0 else 0 %}
+                  {% set my_share = [[fair, m.cap] | min, 0] | max %}
+                  {% set ns.out = ns.out + [{
+                    'id': m.id, 'ip': m.ip, 'sn': m.sn,
+                    'limit': my_share, 'base': m.base,
+                    'last_sent_entity': m.last_sent_entity
+                  }] %}
+                  {% set ns2.br = ns2.br - my_share %}
+                  {% set ns2.un = ns2.un - 1 %}
+                {% endfor %}
+                {% set ns.remaining = ns.remaining - bucket_share %}
+              {% endfor %}
+              {{ ns.out }}
+            {% endif %}
+
+      # ------------------------------------------------------------------
+      # Phase 5: execute writes, gated by per-device hysteresis or
+      # fast-export clamp (matches solo-loop semantics).
+      # ------------------------------------------------------------------
+      - repeat:
+          for_each: "{{ allocations }}"
+          sequence:
+            - variables:
+                a: "{{ repeat.item }}"
+                fast_clamp: >-
+                  {{ shelly_ok and grid_power | float(0) < -80
+                     and (a.limit | int) < (a.base | int) }}
+                significant: >-
+                  {{ (a.limit | int - a.base | int) | abs
+                     > hysteresis_watt | int }}
+            # Dry-run suppresses the actual writes but lets the event in
+            # Phase 6 still fire with the intended allocation — so the
+            # diagnostic + share sensors update as if the loop were live.
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ (fast_clamp or significant)
+                       and not is_state('input_boolean.zendure_dry_run', 'on') }}
+              then:
+                - service: rest_command.zendure_set_output_for
+                  data:
+                    ip: "{{ a.ip }}"
+                    sn: "{{ a.sn }}"
+                    limit: "{{ a.limit | int }}"
+                - service: input_number.set_value
+                  target:
+                    entity_id: "{{ a.last_sent_entity }}"
+                  data:
+                    value: "{{ a.limit | int }}"
+
+      # ------------------------------------------------------------------
+      # Phase 6: publish diagnostics. Trigger-based template sensors
+      # (see section 4 below) subscribe to this event and expose the
+      # decision to dashboards. Fires every tick regardless of whether
+      # writes happened, so the sensors reflect the intended state even
+      # when hysteresis suppresses a write.
+      # ------------------------------------------------------------------
+      - event: zendure_coordinator_tick
+        event_data:
+          target_total: "{{ target_total | int }}"
+          is_failsafe: "{{ is_failsafe }}"
+          strategy: "{{ strategy }}"
+          dry_run: "{{ is_state('input_boolean.zendure_dry_run', 'on') }}"
+          shelly_ok: "{{ shelly_ok }}"
+          grid_power: "{{ grid_power | float(0) | round(1) }}"
+          adjusted_grid_power: "{{ adjusted_grid_power | float(0) | round(1) }}"
+          active_count: "{{ active_count | int }}"
+          force_charge_count: "{{ force_charge_count | int }}"
+          allocations: "{{ allocations }}"
+          devices: "{{ actives_capped }}"
+
+      # Heartbeat — stamped last so it marks completion of the tick.
+      # sensor.zendure_seconds_since_last_tick derives from this.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.zendure_last_tick
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+
+# ==============================================================================
+# 3. MONITORING
+# ==============================================================================
+  - alias: "Zendure: Coordinator Enabled Notice"
+    id: "zendure_coordinator_enabled_notice"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.zendure_coordinator_enabled
+        to: "on"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Zendure Coordinator Active"
+          message: >-
+            Multi-device coordinator enabled. The solo control loop in
+            zendure.yaml is now paused. Writes happen through the generic
+            rest_commands using per-device IP/SN.
+          notification_id: "zendure_coordinator_state"
+
+  - alias: "Zendure: Coordinator Disabled Notice"
+    id: "zendure_coordinator_disabled_notice"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.zendure_coordinator_enabled
+        to: "off"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Zendure Coordinator Inactive"
+          message: >-
+            Multi-device coordinator disabled. Solo control loop resumed
+            for device 1. Device 2 (if any) will hold its last output
+            limit until the coordinator is re-enabled or its state
+            machine fires.
+          notification_id: "zendure_coordinator_state"
+
+  - alias: "Zendure: Dry-Run Enabled Notice"
+    id: "zendure_dry_run_enabled_notice"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.zendure_dry_run
+        to: "on"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Zendure Dry-Run Active"
+          message: >-
+            Dry-run is on — the coordinator will compute allocations and
+            fire diagnostic events every 5 seconds, but won't write to
+            any device. Watch sensor.zendure_coordinator_target and the
+            per-device share sensors, then flip this off when satisfied.
+          notification_id: "zendure_dry_run_state"
+
+  - alias: "Zendure: Dry-Run Disabled Notice"
+    id: "zendure_dry_run_disabled_notice"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.zendure_dry_run
+        to: "off"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Zendure Dry-Run Off"
+          message: >-
+            Dry-run disabled. The coordinator is now writing to devices
+            on every tick (subject to hysteresis and fast-clamp).
+          notification_id: "zendure_dry_run_state"
+
+  - alias: "Zendure: Coordinator Heartbeat Stale"
+    id: "zendure_coordinator_heartbeat_stale"
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ is_state('input_boolean.zendure_coordinator_enabled', 'on')
+             and states('sensor.zendure_seconds_since_last_tick') | int(0) > 15 }}
+        for: "00:00:30"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️ Zendure Coordinator Frozen"
+          message: >-
+            The coordinator hasn't produced a tick for
+            {{ states('sensor.zendure_seconds_since_last_tick') }} s
+            while enabled. Check the automation trace for
+            'Zendure: Multi-Device Coordinator' — a template error or
+            missing helper is the usual cause.
+          notification_id: "zendure_heartbeat_stale"
+
+  - alias: "Zendure: Coordinator Heartbeat Recovered"
+    id: "zendure_coordinator_heartbeat_recovered"
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ states('sensor.zendure_seconds_since_last_tick') | int(99) < 10
+             or is_state('input_boolean.zendure_coordinator_enabled', 'off') }}
+        for: "00:00:10"
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: "zendure_heartbeat_stale"
+
+
+# ==============================================================================
+# 4. DIAGNOSTIC SENSORS (trigger-based)
+# ==============================================================================
+# Subscribe to the zendure_coordinator_tick event fired at the end of every
+# coordinator cycle. The aggregate sensor exposes the full decision as
+# attributes; per-device sensors pull that device's allocated share out of
+# the event payload for easy dashboard display.
+#
+# To add a share sensor for a third device, see tools/generate_device.py.
+
+template:
+  - trigger:
+      - platform: event
+        event_type: zendure_coordinator_tick
+    sensor:
+      - name: "Zendure Coordinator Target"
+        unique_id: zendure_coordinator_target
+        unit_of_measurement: "W"
+        device_class: power
+        state: "{{ trigger.event.data.target_total }}"
+        attributes:
+          strategy: "{{ trigger.event.data.strategy }}"
+          is_failsafe: "{{ trigger.event.data.is_failsafe }}"
+          dry_run: "{{ trigger.event.data.dry_run }}"
+          shelly_ok: "{{ trigger.event.data.shelly_ok }}"
+          grid_power: "{{ trigger.event.data.grid_power }}"
+          adjusted_grid_power: "{{ trigger.event.data.adjusted_grid_power }}"
+          active_count: "{{ trigger.event.data.active_count }}"
+          force_charge_count: "{{ trigger.event.data.force_charge_count }}"
+          allocations: "{{ trigger.event.data.allocations }}"
+          devices: "{{ trigger.event.data.devices }}"
+
+      - name: "Zendure 1 Coordinator Share"
+        unique_id: zendure_1_coordinator_share
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set m = trigger.event.data.allocations
+                     | selectattr('id', 'eq', 1) | list %}
+          {{ m[0].limit if m else 0 }}
+
+      - name: "Zendure 2 Coordinator Share"
+        unique_id: zendure_2_coordinator_share
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set m = trigger.event.data.allocations
+                     | selectattr('id', 'eq', 2) | list %}
+          {{ m[0].limit if m else 0 }}
+
+
+  # ----------------------------------------------------------------------
+  # Fleet aggregates (non-trigger — update with the underlying sensors).
+  # The `ids` list is the only thing to edit when adding device 3+.
+  # Ignore device-1-only setups: at N=1, device-2 sensors are 'unavailable'
+  # and `map('float', 0)` treats them as 0, so the fleet collapses to
+  # device 1's values.
+  # ----------------------------------------------------------------------
+  - sensor:
+      - name: "Zendure Fleet Solar Input"
+        unique_id: zendure_fleet_solar_input
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_solar_input',
+            'sensor.solarflow_2_solar_input',
+          ] %}
+          {{ ids | map('states') | map('float', 0) | sum | round(1) }}
+
+      - name: "Zendure Fleet Battery Charging Power"
+        unique_id: zendure_fleet_battery_charging_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_pack_input_power',
+            'sensor.solarflow_2_pack_input_power',
+          ] %}
+          {{ ids | map('states') | map('float', 0) | sum | round(1) }}
+
+      - name: "Zendure Fleet Battery Discharging Power"
+        unique_id: zendure_fleet_battery_discharging_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_pack_output_power',
+            'sensor.solarflow_2_pack_output_power',
+          ] %}
+          {{ ids | map('states') | map('float', 0) | sum | round(1) }}
+
+      - name: "Zendure Fleet Output Power"
+        unique_id: zendure_fleet_output_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_output_limit',
+            'sensor.solarflow_2_output_limit',
+          ] %}
+          {{ ids | map('states') | map('float', 0) | sum | round(1) }}
+
+      # Mean SoC over devices that are reporting a numeric level. A
+      # 'unavailable' device is excluded rather than dragging the average
+      # to 0 — otherwise a disconnected device would look like a full
+      # fleet discharge.
+      - name: "Zendure Fleet SoC Average"
+        unique_id: zendure_fleet_soc_average
+        unit_of_measurement: "%"
+        device_class: battery
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_battery_level',
+            'sensor.solarflow_2_battery_level',
+          ] %}
+          {% set vals = ids | map('states')
+                            | select('is_number')
+                            | map('float') | list %}
+          {{ (vals | sum / (vals | length)) | round(1)
+             if vals | length > 0 else 0 }}
+
+      # Devices currently reporting OK (REST responding + SN known).
+      # Matches the coordinator's `any_ok` gate, not its stricter `actives`
+      # (which also requires enabled + not force_charge).
+      - name: "Zendure Fleet Active Count"
+        unique_id: zendure_fleet_active_count
+        state_class: measurement
+        state: >
+          {% set ids = [
+            'sensor.solarflow_status_raw',
+            'sensor.solarflow_2_status_raw',
+          ] %}
+          {{ ids | map('states') | select('eq', 'OK') | list | length }}
+
+
+  # ----------------------------------------------------------------------
+  # Heartbeat — seconds since the last coordinator tick. time_pattern
+  # trigger forces the template to re-evaluate every 10 s, so this
+  # sensor counts upward even when no new tick arrives (which is exactly
+  # the condition we want to detect).
+  # ----------------------------------------------------------------------
+  - trigger:
+      - platform: time_pattern
+        seconds: "/10"
+      - platform: state
+        entity_id: input_datetime.zendure_last_tick
+    sensor:
+      - name: "Zendure Seconds Since Last Tick"
+        unique_id: zendure_seconds_since_last_tick
+        unit_of_measurement: "s"
+        state_class: measurement
+        state: >
+          {% set last = states('input_datetime.zendure_last_tick') %}
+          {% if last in ['unknown', 'unavailable', ''] %}
+            -1
+          {% else %}
+            {{ (as_timestamp(now()) - as_timestamp(last)) | int }}
+          {% endif %}
+
+
+# ==============================================================================
+# 5. FLEET ENERGY INTEGRATION (kWh — for the HA Energy dashboard)
+# ==============================================================================
+sensor:
+  - platform: integration
+    source: sensor.zendure_fleet_solar_input
+    name: "Zendure Fleet Solar Energy Total"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.zendure_fleet_battery_charging_power
+    name: "Zendure Fleet Battery Energy Charged"
+    unit_prefix: k
+    round: 3
+    method: left
+  - platform: integration
+    source: sensor.zendure_fleet_battery_discharging_power
+    name: "Zendure Fleet Battery Energy Discharged"
+    unit_prefix: k
+    round: 3
+    method: left
