@@ -119,12 +119,18 @@ automation:
                  - states('sensor.power_export') | float(0) }}
             {% else %} 0 {% endif %}
 
+          # Active season (winter/summer); selects between per-season helpers.
+          # Falls back to "winter" if the season sensor isn't ready yet.
+          season: >-
+            {% set s = states('sensor.zendure_active_season') %}
+            {{ s if s in ['winter', 'summer'] else 'winter' }}
+
           max_output: "{{ states('input_number.zendure_conf_max_output') | int }}"
           failsafe_watt: "{{ states('input_number.zendure_conf_failsafe_watt') | int }}"
-          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt') | int }}"
+          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt_' ~ season) | int }}"
           hysteresis_watt: "{{ states('input_number.zendure_conf_hysteresis') | int }}"
-          grid_bias: "{{ states('input_number.zendure_conf_grid_bias') | int }}"
-          soc_off: "{{ states('input_number.zendure_conf_soc_off') | int }}"
+          grid_bias: "{{ states('input_number.zendure_conf_grid_bias_' ~ season) | int }}"
+          soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int }}"
           soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
           emergency_watt: "{{ states('input_number.zendure_conf_emergency_watt') | int }}"
 
@@ -141,11 +147,16 @@ automation:
               battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
               current_limit: "{{ states('sensor.solarflow_output_limit') | float(0) }}"
               solar: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
-              temp: "{{ states('sensor.solarflow_enclosure_temp') | float(20) }}"
+              temp: "{{ states('sensor.solarflow_device_temp') | float(20) }}"
               last_sent: "{{ states('input_number.zendure_last_sent_limit') | int }}"
               force_charge: >-
                 {{ is_state('input_boolean.zendure_emergency_charge', 'on')
                    or is_state('input_boolean.zendure_calibration_mode', 'on') }}
+              # Configured target SoC (per-mille → %); used by all_active_full.
+              # Falls back to 100 when unreachable.
+              socset: >-
+                {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+                {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
               last_sent_entity: "input_number.zendure_last_sent_limit"
             - id: 2
               ip: "{{ states('input_text.zendure_device_2_ip') }}"
@@ -159,17 +170,24 @@ automation:
               battery: "{{ states('sensor.solarflow_2_battery_level') | float(0) }}"
               current_limit: "{{ states('sensor.solarflow_2_output_limit') | float(0) }}"
               solar: "{{ states('sensor.solarflow_2_solar_input') | float(0) }}"
-              temp: "{{ states('sensor.solarflow_2_enclosure_temp') | float(20) }}"
+              temp: "{{ states('sensor.solarflow_2_device_temp') | float(20) }}"
               last_sent: "{{ states('input_number.zendure_2_last_sent_limit') | int }}"
               force_charge: >-
                 {{ is_state('input_boolean.zendure_2_emergency_charge', 'on')
                    or is_state('input_boolean.zendure_2_calibration_mode', 'on') }}
+              socset: >-
+                {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+                {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
               last_sent_entity: "input_number.zendure_2_last_sent_limit"
 
       # ------------------------------------------------------------------
       # Phase 2: per-device drift correction (self-healing memory).
-      # If a device's last-sent memory has diverged > 150 W from reality,
-      # resync to the reported outputLimit.
+      # If a device's last-sent memory has diverged from reality by more
+      # than the hysteresis floor, resync to the reported outputLimit.
+      # Threshold must be ≤ hysteresis_watt — otherwise a device that
+      # silently resets (e.g. to 0) while last_sent sits in the gap
+      # between the two values gets stranded, since allocation matches
+      # last_sent within hysteresis and no corrective write ever fires.
       # ------------------------------------------------------------------
       - repeat:
           for_each: "{{ devices }}"
@@ -178,7 +196,8 @@ automation:
                 d: "{{ repeat.item }}"
                 is_drifting: >-
                   {{ d.last_sent >= 0
-                     and (d.last_sent - d.current_limit) | abs > 150 }}
+                     and (d.last_sent - d.current_limit) | abs
+                         > hysteresis_watt | int }}
             - if:
                 - condition: template
                   value_template: "{{ d.ok and is_drifting }}"
@@ -199,7 +218,8 @@ automation:
             {% set ns = namespace(out=[]) %}
             {% for d in devices %}
               {% set is_drifting = d.last_sent >= 0
-                 and (d.last_sent - d.current_limit) | abs > 150 %}
+                 and (d.last_sent - d.current_limit) | abs
+                     > hysteresis_watt | int %}
               {% set base = d.current_limit
                  if (d.last_sent < 0 or is_drifting) else d.last_sent %}
               {% set ns.out = ns.out + [d | combine({'base': base | int})] %}
@@ -237,12 +257,21 @@ automation:
             {{ actives | sum(attribute='base') | int }}
           active_pv_total: >-
             {{ actives | sum(attribute='solar') | float(0) }}
+          # Per-device "full" check against each device's own socSet
+          # (1% deadband for sensor rounding). A hardcoded "battery > 98"
+          # would never trigger when socSet < 100 — leaving the saturation
+          # floor below permanently disabled.
           all_active_full: >-
             {% if actives | length == 0 %}
               false
             {% else %}
-              {{ actives | selectattr('battery', '>', 98) | list | length
-                 == actives | length }}
+              {% set ns = namespace(all=true) %}
+              {% for d in actives %}
+                {% if d.battery | float(0) < (d.socset | float(100) - 1) %}
+                  {% set ns.all = false %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.all }}
             {% endif %}
 
       - variables:

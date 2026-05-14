@@ -21,9 +21,14 @@
 # 7. Add configuration.yaml entries (see README)
 # 8. Restart Home Assistant
 #
-# STRATEGY (Managed by Logic Manager):
-# - WINTER: Stop at 20% SoC | Bias 10W (Import) | Saturation 250W
-# - SUMMER: Stop at 8% SoC  | Bias 0W (Zero)    | Saturation 250W
+# STRATEGY:
+# Per-season helpers (zendure_conf_<param>_winter / _summer) drive
+# soc_off, grid_bias, and saturation_watt. The active season is selected
+# by sensor.zendure_active_season, which compares today's MM-DD against
+# input_datetime.zendure_conf_winter_start / _summer_start (year ignored).
+# Defaults reproduce the original behavior:
+#   WINTER (Oct 1 – Apr 1): soc_off=20%, bias=10W, saturation=250W
+#   SUMMER (Apr 1 – Oct 1): soc_off=8%,  bias=0W,  saturation=250W
 #
 # NETWORK STABILITY:
 # - Polling: 15s | Timeout: 30s | No forced updates (Anti-DDoS).
@@ -75,6 +80,21 @@ input_datetime:
     has_date: true
     has_time: true
 
+  # Season boundary dates — only month/day are read; the year in the helper
+  # state is ignored. Defaults match the original hardcoded behavior
+  # (winter: Oct 1 – Apr 1, summer: Apr 1 – Oct 1).
+  zendure_conf_winter_start:
+    name: "Zendure: Winter Start (year ignored)"
+    has_date: true
+    has_time: false
+    initial: "2024-10-01"
+
+  zendure_conf_summer_start:
+    name: "Zendure: Summer Start (year ignored)"
+    has_date: true
+    has_time: false
+    initial: "2024-04-01"
+
 input_number:
   # --- INTERNAL MEMORY ---
   zendure_last_sent_limit:
@@ -104,8 +124,10 @@ input_number:
     unit_of_measurement: "W"
     mode: box
 
-  zendure_conf_saturation_watt:
-    name: "Zendure: Min Output at 100%"
+  # Per-season helpers — the active value is selected by sensor.zendure_active_season,
+  # which compares today's date against zendure_conf_winter_start / _summer_start.
+  zendure_conf_saturation_watt_winter:
+    name: "Zendure: Min Output at 100% (Winter)"
     icon: mdi:water-percent
     min: 0
     max: 800
@@ -114,13 +136,33 @@ input_number:
     unit_of_measurement: "W"
     mode: box
 
-  zendure_conf_grid_bias:
-    name: "Zendure: Grid Buffer (Bias)"
+  zendure_conf_saturation_watt_summer:
+    name: "Zendure: Min Output at 100% (Summer)"
+    icon: mdi:water-percent
+    min: 0
+    max: 800
+    step: 10
+    initial: 250
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_grid_bias_winter:
+    name: "Zendure: Grid Buffer Bias (Winter)"
     icon: mdi:arrow-collapse-right
     min: -100
     max: 100
     step: 5
     initial: 10
+    unit_of_measurement: "W"
+    mode: box
+
+  zendure_conf_grid_bias_summer:
+    name: "Zendure: Grid Buffer Bias (Summer)"
+    icon: mdi:arrow-collapse-right
+    min: -100
+    max: 100
+    step: 5
+    initial: 0
     unit_of_measurement: "W"
     mode: box
 
@@ -145,20 +187,28 @@ input_number:
     mode: box
 
   # --- BATTERY LIMITS ---
-  zendure_conf_soc_off:
-    name: "SoC Limit: Cutoff (Auto-Season)"
+  zendure_conf_soc_off_winter:
+    name: "SoC Cutoff (Winter)"
     icon: mdi:battery-off
     min: 0
     max: 30
     initial: 20
     unit_of_measurement: "%"
 
+  zendure_conf_soc_off_summer:
+    name: "SoC Cutoff (Summer)"
+    icon: mdi:battery-off
+    min: 0
+    max: 30
+    initial: 8
+    unit_of_measurement: "%"
+
   zendure_conf_soc_bypass:
     name: "SoC Limit: Bypass Mode"
     icon: mdi:battery-heart-variant
-    min: 10
+    min: 0
     max: 90
-    initial: 30
+    initial: 20
     unit_of_measurement: "%"
 
   zendure_conf_soc_emerg_start:
@@ -247,6 +297,30 @@ sensor:
 # ==============================================================================
 template:
   - sensor:
+      # Season selector for the control loops. Compares today's MM-DD against
+      # the configured boundary dates (year ignored). Falls back to "winter"
+      # if either helper is unavailable so the loop has a safe default.
+      - name: "Zendure Active Season"
+        unique_id: zendure_active_season
+        icon: mdi:weather-partly-snowy-rainy
+        state: >-
+          {% set ws = states('input_datetime.zendure_conf_winter_start') %}
+          {% set ss = states('input_datetime.zendure_conf_summer_start') %}
+          {% if ws in ['unknown', 'unavailable', ''] or ss in ['unknown', 'unavailable', ''] %}
+            winter
+          {% else %}
+            {% set today = now().strftime('%m-%d') %}
+            {% set ws_md = ws[5:10] %}
+            {% set ss_md = ss[5:10] %}
+            {% if ws_md < ss_md %}
+              {# Boundaries within one calendar year — winter is contiguous. #}
+              {% if ws_md <= today < ss_md %}winter{% else %}summer{% endif %}
+            {% else %}
+              {# Boundaries wrap year-end — winter spans Dec/Jan boundary. #}
+              {% if today >= ws_md or today < ss_md %}winter{% else %}summer{% endif %}
+            {% endif %}
+          {% endif %}
+
       # electricLevel (RO): "Average SOC" (per zenSDK docs)
       - name: "SolarFlow Battery Level"
         unique_id: solarflow_battery_level
@@ -503,13 +577,19 @@ automation:
     action:
       - variables:
           # --- CONFIG ---
+          # Active season (winter/summer) selects between per-season helpers.
+          # Falls back to "winter" if the season sensor isn't ready yet.
+          season: >-
+            {% set s = states('sensor.zendure_active_season') %}
+            {{ s if s in ['winter', 'summer'] else 'winter' }}
+
           max_output: "{{ states('input_number.zendure_conf_max_output') | int }}"
           failsafe_watt: "{{ states('input_number.zendure_conf_failsafe_watt') | int }}"
-          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt') | int }}"
+          saturation_watt: "{{ states('input_number.zendure_conf_saturation_watt_' ~ season) | int }}"
           hysteresis_watt: "{{ states('input_number.zendure_conf_hysteresis') | int }}"
-          grid_bias: "{{ states('input_number.zendure_conf_grid_bias') | int }}"
-          
-          soc_off: "{{ states('input_number.zendure_conf_soc_off') | int }}"
+          grid_bias: "{{ states('input_number.zendure_conf_grid_bias_' ~ season) | int }}"
+
+          soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int }}"
           soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
           
           # --- SENSORS & MEMORY ---
@@ -521,8 +601,12 @@ automation:
           raw_last_sent: "{{ states('input_number.zendure_last_sent_limit') | int }}"
           current_limit: "{{ states('sensor.solarflow_output_limit') | float(0) }}"
           
-          # Check drift
-          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs > 150 }}"
+          # Check drift. Threshold tied to hysteresis_watt so it can't fall
+          # below the write-suppression floor — otherwise a silent device
+          # reset (e.g. outputLimit → 0) within the gap leaves the loop
+          # stuck: allocation matches last_sent within hysteresis, no
+          # corrective write ever fires.
+          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs > hysteresis_watt }}"
           
           # Safe base
           base_value: >
@@ -535,6 +619,13 @@ automation:
           temp_device: "{{ states('sensor.solarflow_device_temp') | float(20) }}"
           battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
           pv_power: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
+
+          # Device's configured target SoC (per-mille → %). Defaults to 100
+          # when the device is unreachable so saturation logic falls back to
+          # the original "battery > 99" behavior.
+          socset: >
+            {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+            {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
 
           grid_power: >
             {% if shelly_ok %}
@@ -586,8 +677,9 @@ automation:
                {# Base logic: Start from Last Sent, add grid discrepancy, subtract bias #}
                {% set target_base = base_value + grid_power - grid_bias %}
                
-               {# Saturation logic #}
-               {% if battery > 98 and pv_power > saturation_watt %}
+               {# Saturation logic — keep PV bypass alive when battery is at
+                  the configured socSet (1% deadband for sensor rounding). #}
+               {% if battery >= socset - 1 and pv_power > saturation_watt %}
                   {% set target_final = [target_base, saturation_watt] | max %}
                {% else %}
                   {% set target_final = target_base %}
@@ -640,13 +732,22 @@ automation:
 # ==============================================================================
 # 7. AUTOMATION C: LOGIC MANAGER (DAILY & CHECK)
 # ==============================================================================
-  # Track last time battery was full
-  - alias: "Zendure: Track 100% Charge"
+  # Track last time battery reached its configured socSet (the device's
+  # full-charge target). Template trigger so the threshold tracks socSet —
+  # a hardcoded "above: 99" would never fire when socSet < 100, leaving
+  # last_full_charge stale and falsely triggering calibration.
+  - alias: "Zendure: Track Full Charge"
     id: "zendure_track_100_percent_stable"
     trigger:
-      - platform: numeric_state
-        entity_id: sensor.solarflow_battery_level
-        above: 99
+      - platform: template
+        value_template: >-
+          {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set socset = p.get('socSet', 1000) | float / 10 %}
+            {{ states('sensor.solarflow_battery_level') | float(0) >= socset - 1 }}
+          {% else %}
+            false
+          {% endif %}
     action:
       - service: input_datetime.set_datetime
         target:
@@ -666,53 +767,11 @@ automation:
         entity_id: sensor.solarflow_battery_level
     
     action:
-      # 1. Season Switch (SoC Limit & Grid Bias & Saturation)
-      - choose:
-          # --- WINTER (October to March) ---
-          - conditions: "{{ now().month >= 10 or now().month < 4 }}"
-            sequence:
-              # Limit: Stop earlier (20%)
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_soc_off
-                data:
-                  value: 20
-              # Bias: Allow 10W grid import (safety margin)
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_grid_bias
-                data:
-                  value: 10
-              # Saturation: 250W
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_saturation_watt
-                data:
-                  value: 250
+      # Season-driven values are now read directly from per-season helpers
+      # via sensor.zendure_active_season. No more silent overwrite of
+      # input_number helpers from this block.
 
-          # --- SUMMER (April to September) ---
-          - conditions: "{{ now().month >= 4 and now().month < 10 }}"
-            sequence:
-              # Limit: Deep discharge (8%)
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_soc_off
-                data:
-                  value: 8
-              # Bias: 0W (true zero export)
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_grid_bias
-                data:
-                  value: 0
-              # Saturation: 250W
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.zendure_conf_saturation_watt
-                data:
-                  value: 250
-
-      # 2. Check Emergency Charge
+      # Check Emergency Charge
       - variables:
           bat: "{{ states('sensor.solarflow_battery_level')|float(0) }}"
           start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
@@ -745,17 +804,23 @@ automation:
                 target:
                   entity_id: input_boolean.zendure_emergency_charge
 
-      # 3. Check Calibration
+      # Check Calibration
       - variables:
           days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
           last_run: "{{ states('input_datetime.zendure_last_full_charge') }}"
+          # Read socSet so the calibration end condition tracks the user's
+          # configured max-charge — hardcoded 100% would never release when
+          # socSet < 100, leaving the device stuck in force-charge.
+          socset: >-
+            {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+            {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
           days_diff: >
             {% if last_run not in ['unknown', 'unavailable'] %}
               {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
             {% else %} 999 {% endif %}
-      
+
       - choose:
-          - conditions: 
+          - conditions:
               - condition: template
                 value_template: "{{ days_diff | float >= days_threshold }}"
               - condition: state
@@ -769,10 +834,10 @@ automation:
                 data:
                   title: "Zendure Cell Maintenance"
                   message: "Starting calibration ({{ days_diff | int }} days without full charge)."
-          
+
           - conditions:
               - condition: template
-                value_template: "{{ bat >= 100 }}"
+                value_template: "{{ bat >= socset - 1 }}"
               - condition: state
                 entity_id: input_boolean.zendure_calibration_mode
                 state: "on"
@@ -783,7 +848,7 @@ automation:
               - service: persistent_notification.create
                 data:
                   title: "Zendure Calibration"
-                  message: "Complete (100% reached)."
+                  message: "Complete (target SoC {{ socset | int }}% reached)."
 
 
 # ==============================================================================

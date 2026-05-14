@@ -2,14 +2,22 @@
 """Generate a Zendure device package for an additional SolarFlow device.
 
 Usage:
+    # Device 3 core package (+ coordinator snippets printed to stdout):
     python3 tools/generate_device.py --n 3 --ip 192.168.30.93
 
-Reads zendure_device2.yaml as the template, replaces the "2" prefixes with
-your device number, substitutes the IP into input_text.zendure_device_N_ip's
-`initial:` value, and writes zendure_deviceN.yaml into the repo root.
+    # Device 3 with the 56 extended sensors as well:
+    python3 tools/generate_device.py --n 3 --ip 192.168.30.93 --extended
+
+    # Extended sensors only for an existing device (e.g. device 2):
+    python3 tools/generate_device.py --n 2 --extended
+
+Reads zendure_device2.yaml as the core template and zendure_extended.yaml
+as the extended-sensor template, replaces the "2" prefixes with your
+device number, and writes zendure_deviceN.yaml / zendure_deviceN_extended.yaml
+into the repo root.
 
 It also prints the two YAML snippets you need to paste into
-zendure_coordinator.yaml:
+zendure_coordinator.yaml (for a new core device):
 
   1. A new entry in the `devices:` list (section 2 — inside the coordinator
      automation's Phase 1 variables block).
@@ -89,18 +97,65 @@ def generate_device_file(n: int, ip: str, source: Path, out_dir: Path) -> Path:
 
     out_path = out_dir / f"zendure_device{n}.yaml"
     out_path.write_text(text)
+    _verify_yaml(text, out_path)
+    return out_path
 
+
+# ---------------------------------------------------------------------------
+# Extended-sensor substitution (for zendure_extended.yaml → zendure_deviceN_extended.yaml)
+# ---------------------------------------------------------------------------
+
+def _apply_extended_substitutions(text: str, n: int) -> str:
+    """Retarget zendure_extended.yaml at sensor.solarflow_N_status_raw.
+
+    Targets only the three functional patterns — not general prose — so
+    comments that mention "SolarFlow 800 Pro" as the device model stay
+    intact instead of becoming "SolarFlow 2 800 Pro".
+    """
+    replacements = [
+        # Source of truth for every template's state_attr(...)
+        ("sensor.solarflow_status_raw",
+         f"sensor.solarflow_{n}_status_raw"),
+        # Every unique_id starts with solarflow_<something>
+        ("unique_id: solarflow_",
+         f"unique_id: solarflow_{n}_"),
+        # Friendly names are all "SolarFlow <something>"
+        ('name: "SolarFlow ',
+         f'name: "SolarFlow {n} '),
+        # Integration sensors at the bottom of the file reference upstream
+        # power sensors via `source:` — those entity IDs also need the
+        # device-N prefix, otherwise the kWh integrations would silently
+        # accumulate against device 1's panel-power sensors.
+        ("source: sensor.solarflow_",
+         f"source: sensor.solarflow_{n}_"),
+        # File header banner (cosmetic, but helps users tell files apart)
+        ("ZENDURE SOLARFLOW - EXTENDED SENSORS ADDON",
+         f"ZENDURE SOLARFLOW DEVICE {n} - EXTENDED SENSORS ADDON"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+def generate_extended_file(n: int, source: Path, out_dir: Path) -> Path:
+    text = source.read_text()
+    text = _apply_extended_substitutions(text, n)
+
+    out_path = out_dir / f"zendure_device{n}_extended.yaml"
+    out_path.write_text(text)
+    _verify_yaml(text, out_path)
+    return out_path
+
+
+def _verify_yaml(text: str, path: Path) -> None:
     try:
         import yaml  # type: ignore
     except ImportError:
-        pass
-    else:
-        try:
-            yaml.safe_load(text)
-        except yaml.YAMLError as e:  # pragma: no cover
-            print(f"WARNING: generated YAML does not parse: {e}", file=sys.stderr)
-
-    return out_path
+        return
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError as e:  # pragma: no cover
+        print(f"WARNING: {path} does not parse as YAML: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -171,59 +226,103 @@ _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, required=True,
-                        help="Device number (must be >= 3)")
-    parser.add_argument("--ip", required=True,
-                        help="Local IPv4 address of the new device")
+                        help="Device number (>= 3 for a new core package; "
+                             ">= 2 when --extended is the only output)")
+    parser.add_argument("--ip",
+                        help="Local IPv4 address of the new device "
+                             "(required when generating the core package)")
+    parser.add_argument("--extended", action="store_true",
+                        help="Also generate zendure_deviceN_extended.yaml "
+                             "from zendure_extended.yaml. For an existing "
+                             "device (typically N=2) where the core file is "
+                             "already installed, this can be the sole output.")
     parser.add_argument("--source", default="zendure_device2.yaml",
-                        help="Template to clone (default: zendure_device2.yaml)")
+                        help="Core template (default: zendure_device2.yaml)")
+    parser.add_argument("--extended-source", default="zendure_extended.yaml",
+                        help="Extended-sensor template "
+                             "(default: zendure_extended.yaml)")
     parser.add_argument("--output-dir", default=".",
                         help="Where to write the generated file (default: cwd)")
     args = parser.parse_args(argv)
 
-    if args.n < 3:
+    n = args.n
+    needs_core = n >= 3
+    if n < 2:
         parser.error(
-            "--n must be >= 3. Device 1 lives in zendure.yaml; "
-            "device 2 lives in zendure_device2.yaml."
+            "--n must be >= 2. Device 1 lives in zendure.yaml."
         )
-
-    if not _IPV4_RE.match(args.ip):
+    if n == 2 and not args.extended:
+        parser.error(
+            "--n 2 is only meaningful with --extended (the core file "
+            "is already zendure_device2.yaml). Pass --extended to produce "
+            "zendure_device2_extended.yaml."
+        )
+    if needs_core and not args.ip:
+        parser.error(
+            "--ip is required when generating a core package (--n >= 3)."
+        )
+    if needs_core and not _IPV4_RE.match(args.ip):
         parser.error(f"--ip {args.ip!r} doesn't look like an IPv4 address")
-
-    source = Path(args.source)
-    if not source.is_file():
-        parser.error(f"source template not found: {source}")
 
     out_dir = Path(args.output_dir)
     if not out_dir.is_dir():
         parser.error(f"output directory not found: {out_dir}")
 
-    out_path = out_dir / f"zendure_device{args.n}.yaml"
-    if out_path.exists():
-        parser.error(f"output file already exists: {out_path} (move it aside first)")
+    # Core package (only for N >= 3; N == 2's core is zendure_device2.yaml itself).
+    if needs_core:
+        source = Path(args.source)
+        if not source.is_file():
+            parser.error(f"source template not found: {source}")
+        core_out = out_dir / f"zendure_device{n}.yaml"
+        if core_out.exists():
+            parser.error(
+                f"output file already exists: {core_out} (move it aside first)"
+            )
+        generate_device_file(n, args.ip, source, out_dir)
+        print(f"Wrote {core_out}")
 
-    generate_device_file(args.n, args.ip, source, out_dir)
-    n = args.n
+    # Extended sensors.
+    if args.extended:
+        ext_source = Path(args.extended_source)
+        if not ext_source.is_file():
+            parser.error(
+                f"extended-sensor template not found: {ext_source}"
+            )
+        ext_out = out_dir / f"zendure_device{n}_extended.yaml"
+        if ext_out.exists():
+            parser.error(
+                f"output file already exists: {ext_out} (move it aside first)"
+            )
+        generate_extended_file(n, ext_source, out_dir)
+        print(f"Wrote {ext_out}")
 
-    print(f"Wrote {out_path}")
-    print()
-    print(f"=== Append to the `devices:` list in zendure_coordinator.yaml ===")
-    print(f"    (inside the 'Zendure: Multi-Device Coordinator' automation,")
-    print(f"     in Phase 1's variables block)")
-    print()
-    print(coordinator_device_block(n))
-    print(f"=== Append to section 4's trigger-based template sensors ===")
-    print(f"    (the `sensor:` list under the zendure_coordinator_tick trigger)")
-    print()
-    print(coordinator_share_sensor(n))
-    print(f"=== Update fleet sensors in section 4 (the non-trigger sensor list) ===")
-    print()
-    print(fleet_sensor_updates(n))
-    print()
-    print(
-        f"Then restart Home Assistant. sensor.solarflow_{n}_status_raw should "
-        f"turn 'OK' once the device responds, and the coordinator will include "
-        f"it from the next 5-second tick."
-    )
+    if needs_core:
+        print()
+        print("=== Append to the `devices:` list in zendure_coordinator.yaml ===")
+        print("    (inside the 'Zendure: Multi-Device Coordinator' automation,")
+        print("     in Phase 1's variables block)")
+        print()
+        print(coordinator_device_block(n))
+        print("=== Append to section 4's trigger-based template sensors ===")
+        print("    (the `sensor:` list under the zendure_coordinator_tick trigger)")
+        print()
+        print(coordinator_share_sensor(n))
+        print("=== Update fleet sensors in section 4 (the non-trigger sensor list) ===")
+        print()
+        print(fleet_sensor_updates(n))
+        print()
+        print(
+            f"Then restart Home Assistant. sensor.solarflow_{n}_status_raw should "
+            f"turn 'OK' once the device responds, and the coordinator will include "
+            f"it from the next 5-second tick."
+        )
+    elif args.extended:
+        print()
+        print(
+            f"Restart Home Assistant (or reload template entities) to pick up "
+            f"the new sensors. They all read from sensor.solarflow_{n}_status_raw, "
+            f"which your existing zendure_device{n}.yaml already defines."
+        )
     return 0
 
 

@@ -259,12 +259,18 @@ automation:
 # 6. LOGIC MANAGER (DEVICE 2 — emergency + calibration checks only)
 # ==============================================================================
 # Seasonal settings live in device 1's Logic Manager and are shared globally.
-  - alias: "Zendure 2: Track 100% Charge"
+  - alias: "Zendure 2: Track Full Charge"
     id: "zendure_2_track_100_percent"
     trigger:
-      - platform: numeric_state
-        entity_id: sensor.solarflow_2_battery_level
-        above: 99
+      - platform: template
+        value_template: >-
+          {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+          {% if p is mapping %}
+            {% set socset = p.get('socSet', 1000) | float / 10 %}
+            {{ states('sensor.solarflow_2_battery_level') | float(0) >= socset - 1 }}
+          {% else %}
+            false
+          {% endif %}
     action:
       - service: input_datetime.set_datetime
         target:
@@ -317,6 +323,9 @@ automation:
       - variables:
           days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
           last_run: "{{ states('input_datetime.zendure_2_last_full_charge') }}"
+          socset: >-
+            {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+            {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
           days_diff: >
             {% if last_run not in ['unknown', 'unavailable'] %}
               {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
@@ -338,7 +347,7 @@ automation:
                   message: "Starting calibration ({{ days_diff | int }} days without full charge)."
           - conditions:
               - condition: template
-                value_template: "{{ bat >= 100 }}"
+                value_template: "{{ bat >= socset - 1 }}"
               - condition: state
                 entity_id: input_boolean.zendure_2_calibration_mode
                 state: "on"
@@ -349,7 +358,7 @@ automation:
               - service: persistent_notification.create
                 data:
                   title: "Zendure 2 Calibration"
-                  message: "Complete (100% reached)."
+                  message: "Complete (target SoC {{ socset | int }}% reached)."
 
 
 # ==============================================================================

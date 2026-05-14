@@ -57,8 +57,9 @@ All sensor comments reference the official zenSDK property name, access mode, an
 | `zendure_extended.yaml` | Drop-in addon: 56 extended sensors for per-panel power, per-pack diagnostics, status flags, config readback, and calculated metrics |
 | `energy_monitoring.yaml` | Shelly 3EM energy monitoring: 3-phase net import/export/consumption with daily & monthly utility meters. Configurable Shelly device ID. |
 | `zendure_device2.yaml` | *(optional, multi-device)* Second device: IP helper, enable flag, REST sensor, 6 core derived sensors, kWh integration, state machine, flash protection, per-device logic manager |
+| `zendure_device2_extended.yaml` | *(optional, multi-device)* 56 extended sensors for device 2 (per-panel PV, per-pack diagnostics, status flags, config readback) — mirror of `zendure_extended.yaml`. Regenerate via `tools/generate_device.py --n 2 --extended`. |
 | `zendure_coordinator.yaml` | *(optional, multi-device)* Coordinator control loop + strategy selector + diagnostic sensors. Replaces the solo loop when `zendure_coordinator_enabled` is on. |
-| `tools/generate_device.py` | *(optional, multi-device)* Generator for device 3+. Clones `zendure_device2.yaml` with the right prefixes / IP and prints the coordinator snippets to paste. |
+| `tools/generate_device.py` | *(optional, multi-device)* Generator for additional devices. Clones `zendure_device2.yaml` with the right prefixes / IP and prints the coordinator snippets to paste. With `--extended`, also clones `zendure_extended.yaml` into `zendure_deviceN_extended.yaml` for 56-sensor parity. |
 
 ---
 
@@ -175,7 +176,7 @@ Switching strategy is safe at runtime — it takes effect on the next 5-second t
 
 ### Adding a second device
 
-1. Copy `zendure_device2.yaml` and `zendure_coordinator.yaml` into `packages/`.
+1. Copy `zendure_device2.yaml` and `zendure_coordinator.yaml` into `packages/`. Optionally also copy `zendure_device2_extended.yaml` for the same 56-sensor catalogue device 1 has.
 2. Set the second device's IP in **Settings → Devices & Services → Helpers → Zendure 2: Device IP Address**, or edit the `initial` field in `zendure_device2.yaml`.
 3. Add the new high-frequency entities to the recorder and logbook excludes. The coordinator ticks every 5 s and updates `input_datetime.zendure_last_tick` on each cycle; the aggregate target sensor has attribute churn on every tick too — both are noisy without exclusion:
 
@@ -216,10 +217,14 @@ The coordinator takes over. You'll get a persistent notification confirming the 
 The `devices` list in `zendure_coordinator.yaml` is the single source of truth and the allocation logic is N-agnostic. Use the generator:
 
 ```bash
+# Core package only (6 derived sensors + state machine + flash protection):
 python3 tools/generate_device.py --n 3 --ip 192.168.30.93
+
+# Core package + the 56-sensor extended set:
+python3 tools/generate_device.py --n 3 --ip 192.168.30.93 --extended
 ```
 
-This writes `zendure_device3.yaml` (a copy of the device-2 package with `_2` → `_3` everywhere and the IP set) and prints two small YAML snippets to stdout: a new `devices:` list entry and a new coordinator-share sensor. Paste both into `zendure_coordinator.yaml` at the locations indicated in the output, then restart Home Assistant.
+This writes `zendure_device3.yaml` (a copy of the device-2 package with `_2` → `_3` everywhere and the IP set), and — with `--extended` — also `zendure_device3_extended.yaml`. It prints two YAML snippets to stdout: a new `devices:` list entry and a new coordinator-share sensor. Paste both into `zendure_coordinator.yaml` at the locations indicated in the output, then restart Home Assistant.
 
 No changes to the allocation algorithm, drift recovery, saturation, failsafe, or hysteresis are needed — the logic scales automatically with every device you add. The generator only uses the Python standard library (plus PyYAML if available, for a post-generation parse check), so no `pip install` required.
 
@@ -385,7 +390,7 @@ views:
                 name: Actual output
               - entity: sensor.solarflow_solar_input
                 name: Solar
-              - entity: sensor.solarflow_enclosure_temp
+              - entity: sensor.solarflow_device_temp
                 name: Temperature
               - type: divider
               - input_boolean.zendure_emergency_charge
@@ -403,7 +408,7 @@ views:
                 name: Actual output
               - entity: sensor.solarflow_2_solar_input
                 name: Solar
-              - entity: sensor.solarflow_2_enclosure_temp
+              - entity: sensor.solarflow_2_device_temp
                 name: Temperature
               - type: divider
               - input_boolean.zendure_2_emergency_charge
@@ -428,13 +433,17 @@ The second-device package ships with 6 core derived sensors — enough for the c
 
 - battery level, output limit, solar input, enclosure temperature, pack input power, pack output power
 
-The full 56-sensor extended set from `zendure_extended.yaml` (per-panel PV, per-pack cell diagnostics, config readback, status flags) is **device-1 only** by default. If you want the same depth on device 2, copy `zendure_extended.yaml` to `zendure_device2_extended.yaml` and do a find-and-replace of:
+The full 56-sensor extended set from `zendure_extended.yaml` (per-panel PV, per-pack cell diagnostics, config readback, status flags) is **opt-in per device**. Generate it with:
 
-- `solarflow_status_raw` → `solarflow_2_status_raw`
-- every `unique_id: solarflow_…` → `solarflow_2_…`
-- every `name: "SolarFlow …"` → `"SolarFlow 2 …"`
+```bash
+# Extended sensors for the already-installed device 2:
+python3 tools/generate_device.py --n 2 --extended
 
-This is mechanical but tedious — a generator script is a possible future addition.
+# Or when adding a new device 3 with extended sensors in one go:
+python3 tools/generate_device.py --n 3 --ip 192.168.30.93 --extended
+```
+
+This writes `zendure_deviceN_extended.yaml` alongside the other package files. The generator preserves the structure of `zendure_extended.yaml` and only retargets the three functional patterns (`sensor.solarflow_status_raw`, every `unique_id:`, every `name:`) — prose comments that mention "SolarFlow 800 Pro" as the device model are left alone.
 
 ### Behavioral notes
 
@@ -506,7 +515,7 @@ Compared to [Utini2000/Zendure-Solarflow-Local-HomeAssistant](https://github.com
 | **Configurable Shelly IDs** | `energy_monitoring.yaml` uses `input_text` helpers for the Shelly 3EM device ID and solar sensor entity, replacing 6+ hardcoded entity references. |
 | **Multi-device coordinator** *(opt-in)* | `zendure_coordinator.yaml` + `zendure_device2.yaml` add coordination for N ≥ 2 SolarFlow devices sharing one grid meter. Three allocation strategies (`priority_by_soc`, `priority_by_soc_bucketed`, `equal_split`) with water-fill redistribution, per-device enable flag, force-charge grid compensation, and the same drift/hysteresis/failsafe semantics as the solo loop. Solo users see zero behavior change. |
 | **Coordinator observability** *(opt-in)* | Diagnostic sensors (`sensor.zendure_coordinator_target` + per-device `…_coordinator_share`) fed by a `zendure_coordinator_tick` event each cycle. Fleet aggregate sensors summing across devices. Dry-run mode for pre-deployment validation. Heartbeat sensor and frozen-loop alert. Per-device offline notifications. |
-| **Device generator** *(opt-in)* | `tools/generate_device.py` clones `zendure_device2.yaml` into `zendure_deviceN.yaml` with correct prefixes + IP and prints the coordinator snippets to paste. Stdlib-only. |
+| **Device generator** *(opt-in)* | `tools/generate_device.py` clones `zendure_device2.yaml` into `zendure_deviceN.yaml` with correct prefixes + IP and prints the coordinator snippets to paste. With `--extended`, also clones `zendure_extended.yaml` into `zendure_deviceN_extended.yaml` for 56-sensor parity per device. Stdlib-only. |
 
 ---
 
@@ -629,9 +638,11 @@ Compared to [Utini2000/Zendure-Solarflow-Local-HomeAssistant](https://github.com
 </details>
 
 <details>
-<summary><strong>Device 2 sensors</strong> (zendure_device2.yaml) — 6 core + 3 energy</summary>
+<summary><strong>Device 2 sensors</strong> (zendure_device2.yaml + zendure_device2_extended.yaml) — 6 core + 3 energy + 56 extended</summary>
 
 Mirror of the core / power-flow sets above, with `_2` / `SolarFlow 2 ` prefixes. Reads from `sensor.solarflow_2_status_raw`.
+
+Core (from `zendure_device2.yaml`):
 
 | Sensor | Notes |
 |---|---|
@@ -645,7 +656,9 @@ Mirror of the core / power-flow sets above, with `_2` / `SolarFlow 2 ` prefixes.
 | SolarFlow 2 Battery Energy Charged | kWh |
 | SolarFlow 2 Battery Energy Discharged | kWh |
 
-Additional devices (3+) follow the same pattern via `tools/generate_device.py`. Device-2's extended sensors (the 56-sensor set from `zendure_extended.yaml`) are *not* shipped by default — see **Core vs extended sensors for additional devices**.
+Extended (from `zendure_device2_extended.yaml`): same 56-sensor catalogue documented in the other collapsible sections above (PV channels, power flow, battery system, per-pack × 2, device & status, configuration readback, calculated), each with the `solarflow_2_` / `"SolarFlow 2 "` prefix.
+
+Additional devices (3+) follow the same pattern via `tools/generate_device.py` — use `--extended` to also produce the 56-sensor file.
 
 </details>
 
