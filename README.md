@@ -89,31 +89,20 @@ config/
 
 ### 3. Set the device IP
 
-Open `zendure.yaml` and set the `initial` value of `input_text.zendure_device_ip` to your SolarFlow's IP address:
+After the package loads, set your SolarFlow's IP from the HA UI under **Settings → Devices & Services → Helpers → "Zendure: Device IP Address"**. The helper has no `initial:` value, so what you enter is restored across restarts and persists.
 
-```yaml
-input_text:
-  zendure_device_ip:
-    initial: "192.168.1.100"   # ← your SolarFlow IP here
-```
-
-After first startup, you can also change this from the HA UI under **Settings → Devices & Services → Helpers** without editing YAML.
+> **Why no `initial:` in the YAML?** Home Assistant restores a helper's last value across restarts *only when `initial:` is absent*. Earlier versions shipped an `initial:` IP, which forced that value back on every restart and silently wiped any change made in the UI. Don't re-add `initial:` unless you deliberately want a fixed, restart-enforced IP.
 
 ### 3b. Set the Shelly device IDs
 
-In `energy_monitoring.yaml`, set the two `input_text` helpers:
+Set the two Shelly helpers from the HA UI under **Settings → Devices & Services → Helpers** — both persist across restarts (neither has an `initial:` value; see the note above):
 
-```yaml
-input_text:
-  shelly_3em_device_id:
-    initial: "d890ewfh"        # ← your Shelly Pro 3EM device ID
-  shelly_solar_entity:
-    initial: "sensor.shellypmminig3_5432046f3b24_power"  # ← your solar sensor entity ID, or "none"
-```
+- **Shelly 3EM: Device ID** — the device-ID portion of your Shelly Pro 3EM entity IDs.
+- **Shelly Solar: Entity ID** — the full entity ID of your solar-generation sensor, or `none`.
 
 To find your Shelly 3EM device ID: go to **Settings → Devices → (your Shelly Pro 3EM) → Entities**. Your phase sensors will be named `sensor.shellypro3em_XXXXXXXX_phase_a_active_power` — the `XXXXXXXX` part is your device ID.
 
-If you don't have a separate Shelly PM Mini for solar generation measurement, set `shelly_solar_entity` to `"none"`.
+If you don't have a separate Shelly PM Mini for solar generation measurement, set **Shelly Solar: Entity ID** to `none`.
 
 ### 4. Update configuration.yaml
 
@@ -177,7 +166,7 @@ Switching strategy is safe at runtime — it takes effect on the next 5-second t
 ### Adding a second device
 
 1. Copy `zendure_device2.yaml` and `zendure_coordinator.yaml` into `packages/`. Optionally also copy `zendure_device2_extended.yaml` for the same 56-sensor catalogue device 1 has.
-2. Set the second device's IP in **Settings → Devices & Services → Helpers → Zendure 2: Device IP Address**, or edit the `initial` field in `zendure_device2.yaml`.
+2. Set the second device's IP in **Settings → Devices & Services → Helpers → Zendure 2: Device IP Address** (it persists across restarts — the helper has no `initial:` value).
 3. Add the new high-frequency entities to the recorder and logbook excludes. The coordinator ticks every 5 s and updates `input_datetime.zendure_last_tick` on each cycle; the aggregate target sensor has attribute churn on every tick too — both are noisy without exclusion:
 
    ```yaml
@@ -503,7 +492,7 @@ Compared to [Utini2000/Zendure-Solarflow-Local-HomeAssistant](https://github.com
 
 | Change | Detail |
 |---|---|
-| **Centralised IP** | Single `input_text.zendure_device_ip` helper replaces hardcoded IPs. Editable from the HA UI. |
+| **Centralised IP** | Single `input_text.zendure_device_ip` helper replaces hardcoded IPs. Set from the HA UI and persisted across restarts (no `initial:`). |
 | **Modern REST integration** | Switched from `sensor: platform: rest` to the `rest:` integration with `resource_template` to support the templated IP. |
 | **`packData` attribute** | Added to `json_attributes` so per-battery sensors can read pack-level diagnostics. |
 | **Flash protection** | New automation sets `smartMode=1` (RAM writes) on startup, preventing ~17 000 flash writes/day from the 5-second control loop. |

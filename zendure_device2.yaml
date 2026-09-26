@@ -31,20 +31,23 @@
 # 1. CONFIGURATION (DEVICE 2 HELPERS)
 # ==============================================================================
 input_text:
+  # No `initial:` — restores across restarts so a UI-entered IP persists.
+  # (Re-adding `initial:` would force it on every restart and wipe UI edits.)
   zendure_device_2_ip:
     name: "Zendure 2: Device IP Address"
     icon: mdi:ip-network
-    initial: "192.168.30.92"
     pattern: "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
     mode: text
 
 input_boolean:
   # Participation flag for the coordinator. Flip off to temporarily remove
   # device 2 from the active set without changing its IP or powering it off.
+  # No `initial:` so the toggle survives a restart. Trade-off: a fresh install
+  # with no stored state defaults to OFF — device 2 sits out until switched
+  # on. Re-add `initial: true` for participate-by-default on first boot.
   zendure_2_enabled:
     name: "Zendure 2: Device Enabled"
     icon: mdi:power
-    initial: true
 
   zendure_2_emergency_charge:
     name: "Zendure 2: Emergency Charging"
@@ -288,11 +291,13 @@ automation:
       - platform: state
         entity_id: sensor.solarflow_2_battery_level
     action:
-      # Emergency charge check
+      # Emergency charge check — see device-1 Logic Manager for rationale
+      # behind effective_stop (prevents oscillation when stop ≤ start).
       - variables:
           bat: "{{ states('sensor.solarflow_2_battery_level')|float(0) }}"
           start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
-          stop_lim: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          stop_raw: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          stop_lim: "{{ [stop_raw, start_lim + 1] | max }}"
           forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
           thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
       - choose:

@@ -45,10 +45,13 @@
 # 1. HELPERS (COORDINATOR SWITCH + ALLOCATION STRATEGY)
 # ==============================================================================
 input_boolean:
+  # No `initial:` so the coordinator's on/off state survives a restart — with
+  # `initial: false` it reverted to OFF on every restart, silently dropping a
+  # running fleet back to the device-1 solo loop until manually re-enabled.
+  # Fresh installs (no stored state) still default to OFF = solo mode.
   zendure_coordinator_enabled:
     name: "Zendure: Multi-Device Coordinator Active"
     icon: mdi:lan-connect
-    initial: false
 
   # When on, the coordinator computes allocations as usual and fires the
   # diagnostic event, but skips the actual REST writes + last_sent updates.
@@ -71,17 +74,20 @@ input_select:
   zendure_allocation_strategy:
     name: "Zendure: Allocation Strategy"
     icon: mdi:scale-balance
+    # No `initial:` so a UI change to the strategy survives a restart. A fresh
+    # install with no stored state falls back to the FIRST option, so the
+    # recommended default (bucketed) is listed first on purpose.
     options:
+      # Bucketed priority with 2% SoC deadband — prevents oscillation between
+      # devices whose SoC crosses over within a bucket. Recommended default;
+      # kept first so it's also the fresh-install fallback.
+      - priority_by_soc_bucketed
       # Strict priority. High-SoC device fully loaded before the next one
       # contributes. True SoC ties share equally.
       - priority_by_soc
-      # Bucketed priority with 2% SoC deadband — prevents oscillation between
-      # devices whose SoC crosses over within a bucket. Recommended default.
-      - priority_by_soc_bucketed
       # All active devices treated as one bucket: target is divided equally,
       # water-filled for cap constraints. Ignores SoC for allocation.
       - equal_split
-    initial: priority_by_soc_bucketed
 
 
 # ==============================================================================
@@ -157,6 +163,15 @@ automation:
               socset: >-
                 {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
                 {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
+              # Observed AC import power. Used by adjusted_grid_power when this
+              # device is force-charging — subtracts the device's *real* draw
+              # from the grid signal so the active set doesn't try to cover it.
+              # Falls back to nominal emergency_watt when the device is
+              # offline or doesn't expose the field.
+              grid_in: >-
+                {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+                {{ (p.get('gridInputPower', emergency_watt | int) | int)
+                   if p is mapping else (emergency_watt | int) }}
               last_sent_entity: "input_number.zendure_last_sent_limit"
             - id: 2
               ip: "{{ states('input_text.zendure_device_2_ip') }}"
@@ -178,6 +193,10 @@ automation:
               socset: >-
                 {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
                 {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
+              grid_in: >-
+                {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+                {{ (p.get('gridInputPower', emergency_watt | int) | int)
+                   if p is mapping else (emergency_watt | int) }}
               last_sent_entity: "input_number.zendure_2_last_sent_limit"
 
       # ------------------------------------------------------------------
@@ -194,10 +213,15 @@ automation:
           sequence:
             - variables:
                 d: "{{ repeat.item }}"
+                # `>=` (not `>`) on drift, paired with `>` on write hysteresis
+                # below: at exactly drift == hysteresis_watt, drift correction
+                # wins. Otherwise a device drifted by exactly the floor would
+                # be invisible to both correction and writes, sitting at a
+                # fixed offset forever.
                 is_drifting: >-
                   {{ d.last_sent >= 0
                      and (d.last_sent - d.current_limit) | abs
-                         > hysteresis_watt | int }}
+                         >= hysteresis_watt | int }}
             - if:
                 - condition: template
                   value_template: "{{ d.ok and is_drifting }}"
@@ -219,7 +243,7 @@ automation:
             {% for d in devices %}
               {% set is_drifting = d.last_sent >= 0
                  and (d.last_sent - d.current_limit) | abs
-                     > hysteresis_watt | int %}
+                     >= hysteresis_watt | int %}
               {% set base = d.current_limit
                  if (d.last_sent < 0 or is_drifting) else d.last_sent %}
               {% set ns.out = ns.out + [d | combine({'base': base | int})] %}
@@ -248,33 +272,46 @@ automation:
                | selectattr('force_charge')
                | list | length }}
 
-          # Compensate grid_power for the known AC draw of force-charging
-          # devices, so the active set doesn't try to cover their intake.
+          # Compensate grid_power for the *observed* AC draw of each
+          # force-charging device, so the active set doesn't try to cover
+          # their intake. We use each device's reported gridInputPower
+          # rather than the nominal emergency_watt — the actual draw
+          # ramps from 0 to peak over several seconds and tapers as the
+          # battery approaches socSet, so nominal-based correction can
+          # swing the active set by hundreds of watts in either direction.
+          # Per-device grid_in defaults to emergency_watt if the device
+          # is offline (preserves the old behavior in failure cases).
           adjusted_grid_power: >-
-            {{ grid_power - (force_charge_count | int * emergency_watt) }}
+            {% set force_devices = devices_ext
+               | selectattr('ok')
+               | selectattr('enabled')
+               | selectattr('force_charge')
+               | list %}
+            {{ grid_power - (force_devices | sum(attribute='grid_in') | int) }}
 
           base_value_total: >-
             {{ actives | sum(attribute='base') | int }}
-          active_pv_total: >-
-            {{ actives | sum(attribute='solar') | float(0) }}
-          # Per-device "full" check against each device's own socSet
-          # (1% deadband for sensor rounding). A hardcoded "battery > 98"
-          # would never trigger when socSet < 100 — leaving the saturation
-          # floor below permanently disabled.
-          all_active_full: >-
-            {% if actives | length == 0 %}
-              false
-            {% else %}
-              {% set ns = namespace(all=true) %}
-              {% for d in actives %}
-                {% if d.battery | float(0) < (d.socset | float(100) - 1) %}
-                  {% set ns.all = false %}
-                {% endif %}
-              {% endfor %}
-              {{ ns.all }}
-            {% endif %}
 
       - variables:
+          # Per-device saturation contribution: a device that is at-or-above
+          # its own socSet AND producing PV above saturation_watt contributes
+          # saturation_watt to the fleet floor. Asymmetric setups (one
+          # device full + sunny, the other empty or shaded) still get the
+          # bypass-keep-alive floor on the producing device — matching the
+          # solo loop's per-device semantics. The old pooled check
+          # (active_pv_total > saturation_watt * active_count, gated by
+          # all_active_full) silently dropped the floor whenever one
+          # device was empty or had no PV.
+          saturation_floor: >-
+            {% set ns = namespace(val=0) %}
+            {% for d in actives %}
+              {% if d.battery | float(0) >= (d.socset | float(100) - 1)
+                    and d.solar | float(0) > saturation_watt | int %}
+                {% set ns.val = ns.val + saturation_watt | int %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.val }}
+
           # -1  → abort (no writes this tick)
           # >=0 → target total that will be distributed across active devices
           target_total: >-
@@ -287,9 +324,8 @@ automation:
               {% set t = base_value_total | int
                        + adjusted_grid_power | float(0)
                        - grid_bias | int %}
-              {% if all_active_full and active_pv_total
-                     > saturation_watt | int * active_count | int %}
-                {% set t = [t, saturation_watt | int * active_count | int] | max %}
+              {% if saturation_floor | int > 0 %}
+                {% set t = [t, saturation_floor | int] | max %}
               {% endif %}
               {% set t = [t, 0] | max %}
               {% set t = [t, max_output | int * active_count | int] | min %}
@@ -534,11 +570,15 @@ automation:
 
   - alias: "Zendure: Coordinator Heartbeat Stale"
     id: "zendure_coordinator_heartbeat_stale"
+    # Threshold (45 s) > REST sensor timeout (30 s), so a single hung
+    # HTTP poll to a device — which blocks this automation — doesn't
+    # trip a false alarm. Loop runs every 5 s, so 45 s is still ~9 ticks
+    # late: real freezes still surface promptly.
     trigger:
       - platform: template
         value_template: >-
           {{ is_state('input_boolean.zendure_coordinator_enabled', 'on')
-             and states('sensor.zendure_seconds_since_last_tick') | int(0) > 15 }}
+             and states('sensor.zendure_seconds_since_last_tick') | int(0) > 45 }}
         for: "00:00:30"
     action:
       - service: persistent_notification.create
@@ -557,7 +597,7 @@ automation:
     trigger:
       - platform: template
         value_template: >-
-          {{ states('sensor.zendure_seconds_since_last_tick') | int(99) < 10
+          {{ states('sensor.zendure_seconds_since_last_tick') | int(99) < 30
              or is_state('input_boolean.zendure_coordinator_enabled', 'off') }}
         for: "00:00:10"
     action:

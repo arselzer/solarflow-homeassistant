@@ -40,13 +40,14 @@
 # ==============================================================================
 
 # ── DEVICE IP (CENTRAL CONFIGURATION) ────────────────────────────────────────
-# Change this to your SolarFlow's local IP address.
-# Editable from the HA UI: Settings → Devices → Helpers
+# Set this from the HA UI: Settings → Devices → Helpers → "Zendure: Device
+# IP Address". There is intentionally no `initial:` — the helper restores its
+# last value across restarts, so a value entered in the UI persists. Re-adding
+# `initial:` would force that literal on every restart and wipe UI edits.
 input_text:
   zendure_device_ip:
     name: "Zendure: Device IP Address"
     icon: mdi:ip-network
-    initial: "192.168.30.91"
     pattern: "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
     mode: text
 
@@ -59,10 +60,13 @@ input_boolean:
   # Device-1 participation flag for the multi-device coordinator. Solo mode
   # ignores this entirely — leave it on. In coordinator mode, flipping it off
   # removes device 1 from the active set (useful during maintenance).
+  # No `initial:` so a maintenance toggle survives a restart. Trade-off: a
+  # fresh install with no stored state defaults to OFF (HA input_boolean
+  # default = off), i.e. device 1 sits out until switched on. Re-add
+  # `initial: true` if you prefer participate-by-default on first boot.
   zendure_enabled:
     name: "Zendure: Device 1 Enabled"
     icon: mdi:power
-    initial: true
 
   zendure_emergency_charge:
     name: "Status: Emergency Charging"
@@ -606,7 +610,7 @@ automation:
           # reset (e.g. outputLimit → 0) within the gap leaves the loop
           # stuck: allocation matches last_sent within hysteresis, no
           # corrective write ever fires.
-          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs > hysteresis_watt }}"
+          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs >= hysteresis_watt }}"
           
           # Safe base
           base_value: >
@@ -634,8 +638,13 @@ automation:
 
 
       # --- SELF-HEALING MEMORY ---
+      # Gated on zendure_ok and sn_ok: if the REST sensor is briefly
+      # 'unavailable', `current_limit` defaults to 0 (line above), which
+      # would falsely fire is_drifting and stamp last_sent to 0. The
+      # coordinator gates the same correction at zendure_coordinator.yaml
+      # Phase 2 via `if d.ok and is_drifting`.
       - choose:
-          - conditions: "{{ is_drifting }}"
+          - conditions: "{{ is_drifting and zendure_ok and sn_ok }}"
             sequence:
               - service: input_number.set_value
                 target:
@@ -772,13 +781,19 @@ automation:
       # input_number helpers from this block.
 
       # Check Emergency Charge
+      # `effective_stop` enforces stop > start at runtime — the helper
+      # bounds permit stop ≤ start (legal per UI), which would oscillate
+      # the boolean on every Logic Manager tick (start fires when
+      # bat<start, stop fires when bat>stop, and any band where both
+      # conditions hold causes flapping). Clamp stop to at least start+1.
       - variables:
           bat: "{{ states('sensor.solarflow_battery_level')|float(0) }}"
           start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
-          stop_lim: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          stop_raw: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
+          stop_lim: "{{ [stop_raw, start_lim + 1] | max }}"
           forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
           thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
-      
+
       - choose:
           - conditions:
               - condition: template
@@ -792,7 +807,7 @@ automation:
               - service: input_boolean.turn_on
                 target:
                   entity_id: input_boolean.zendure_emergency_charge
-          
+
           - conditions:
               - condition: template
                 value_template: "{{ bat > stop_lim }}"

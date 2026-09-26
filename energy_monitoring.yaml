@@ -34,19 +34,21 @@ input_text:
   # The device ID portion of your Shelly Pro 3EM entity IDs.
   # Example: if your entities are sensor.shellypro3em_d890ewfh_phase_a_active_power
   #          then set this to "d890ewfh"
+  # Set it from the HA UI (Settings → Devices → Helpers). No `initial:` — the
+  # value restores across restarts and persists; re-adding it would wipe edits.
   shelly_3em_device_id:
     name: "Shelly 3EM: Device ID"
     icon: mdi:identifier
-    initial: "d890ewfh"
     mode: text
 
   # Full entity ID of the solar generation power sensor.
-  # Leave at "none" if you don't have a separate solar generation sensor.
-  # Example: "sensor.shellypmminig3_5432046f3b24_power"
+  # Set it from the HA UI, or set to "none" if you have no separate solar
+  # generation sensor. Example: "sensor.shellypmminig3_5432046f3b24_power".
+  # No `initial:` — restores across restarts. On a fresh install with no stored
+  # state it is empty, which the consumption template treats as "none".
   shelly_solar_entity:
     name: "Shelly Solar: Entity ID"
     icon: mdi:solar-power-variant
-    initial: "sensor.shellypmminig3_5432046f3b24_power"
     mode: text
 
 
